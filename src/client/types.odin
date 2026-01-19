@@ -85,6 +85,7 @@ Scenario_Stats :: struct {
     trades_received: u64,
     cancels_sent:    u64,
     cancel_acks:     u64,
+    tob_received:    u64,
     rejects:         u64,
     start_time:      i64,
     end_time:        i64,

@@ -1,98 +1,143 @@
-# build.sh
 #!/usr/bin/env bash
-set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="$ROOT_DIR/bin"
-OUT_BIN="$BIN_DIR/test_client"
+set -e
 
-MODE="debug"          # debug | release
-DO_CLEAN=0
-DO_BUILD=0
-DO_RUN=0
-DO_TEST=0
+PROJECT_NAME="test_client"
+SRC_DIR="src"
+BIN_DIR="bin"
 
-DO_STRICT_STYLE=1
-DO_VET_STYLE=1
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-EXTRA_FLAGS=()
+print_status() { echo -e "${CYAN}==>${NC} $1"; }
+print_success() { echo -e "${GREEN}==>${NC} $1"; }
+print_error() { echo -e "${RED}==>${NC} $1"; }
 
-usage() {
-  cat <<'EOF'
-Usage:
-  ./build.sh [--clean] [--build] [--run] [--test] [--debug|--release]
-             [--no-strict-style] [--no-vet-style] [-- <extra odin flags...>]
+cmd_build() {
+    mkdir -p "$BIN_DIR"
+    print_status "Building $PROJECT_NAME..."
+    
+    local flags="-debug"
+    if [[ "$1" == "release" ]]; then
+        flags="-o:speed -disable-assert -no-bounds-check"
+    fi
+    
+    echo -e "${CYAN}==>${NC} odin build $SRC_DIR -out:$BIN_DIR/$PROJECT_NAME $flags"
+    odin build "$SRC_DIR" \
+        -out:"$BIN_DIR/$PROJECT_NAME" \
+        $flags \
+        -strict-style \
+        -vet-style \
+        -show-timings \
+        -warnings-as-errors
+    
+    print_success "Build complete: $BIN_DIR/$PROJECT_NAME"
+}
 
-Note:
-  This script builds from ./src, so imports inside src should look like:
-    import "client/protocol_binary"
+cmd_run() {
+    if [[ ! -f "$BIN_DIR/$PROJECT_NAME" ]]; then
+        cmd_build
+    fi
+    print_status "Running: $BIN_DIR/$PROJECT_NAME $*"
+    "$BIN_DIR/$PROJECT_NAME" "$@"
+}
+
+cmd_clean() {
+    print_status "Cleaning..."
+    rm -rf "$BIN_DIR"
+    print_success "Cleaned"
+}
+
+cmd_scenario() {
+    local scenario="$1"
+    local host="${2:-127.0.0.1}"
+    local port="${3:-1234}"
+    
+    if [[ -z "$scenario" ]]; then
+        print_error "Usage: ./build.sh scenario <num> [host] [port]"
+        echo ""
+        echo "Scenarios:"
+        echo "  1   Simple orders (no match) + Flush"
+        echo "  2   Matching orders"
+        echo "  3   Order + Cancel"
+        echo "  20  Stress: 2k orders / 1k trades"
+        echo "  21  Stress: 20k orders / 10k trades"
+        echo "  22  Stress: 200k orders / 100k trades"
+        echo "  30  Dual symbol: 2k orders"
+        echo "  31  Dual symbol: 20k orders"
+        return 1
+    fi
+    
+    if [[ ! -f "$BIN_DIR/$PROJECT_NAME" ]]; then
+        cmd_build
+    fi
+    
+    print_status "Running scenario $scenario against $host:$port"
+    "$BIN_DIR/$PROJECT_NAME" "$scenario" "$host" "$port"
+}
+
+cmd_help() {
+    cat << EOF
+Usage: ./build.sh <command> [args]
+
+Commands:
+    build [release]           Build the client (debug by default)
+    run [args]                Build and run with arguments
+    clean                     Remove build artifacts
+    scenario <n> [host] [port]  Run scenario N against server
+    help                      Show this message
+
+Scenario shortcuts:
+    ./build.sh scenario 1                 # Basic no-match test
+    ./build.sh scenario 2                 # Matching orders
+    ./build.sh scenario 20                # 2k order stress test
+    ./build.sh scenario 30                # Dual-symbol test
+    ./build.sh scenario 21 192.168.1.5    # Remote server
+
+Examples:
+    ./build.sh build
+    ./build.sh build release
+    ./build.sh scenario 1
+    ./build.sh scenario 20 localhost 1234
 EOF
 }
 
-die() { echo "error: $*" >&2; exit 1; }
+# ============================================================================
+# Main
+# ============================================================================
 
-if [[ $# -eq 0 ]]; then
-  DO_BUILD=1
-fi
+cd "$(dirname "$0")"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --help|-h) usage; exit 0 ;;
-    --clean) DO_CLEAN=1; shift ;;
-    --build) DO_BUILD=1; shift ;;
-    --run) DO_RUN=1; DO_BUILD=1; shift ;;
-    --test) DO_TEST=1; shift ;;
-    --debug) MODE="debug"; shift ;;
-    --release) MODE="release"; shift ;;
-    --no-strict-style) DO_STRICT_STYLE=0; shift ;;
-    --no-vet-style) DO_VET_STYLE=0; shift ;;
-    --) shift; EXTRA_FLAGS+=("$@"); break ;;
-    *) die "unknown argument: $1 (use --help)" ;;
-  esac
-done
-
-cd "$ROOT_DIR"
-mkdir -p "$BIN_DIR"
-
-if [[ $DO_CLEAN -eq 1 ]]; then
-  echo "==> Cleaning: $BIN_DIR"
-  rm -rf "$BIN_DIR"
-  mkdir -p "$BIN_DIR"
-fi
-
-odin_flags=()
-if [[ "$MODE" == "debug" ]]; then
-  odin_flags+=("-debug")
-else
-  odin_flags+=("-o:speed")
-fi
-
-if [[ $DO_STRICT_STYLE -eq 1 ]]; then
-  odin_flags+=("-strict-style")
-fi
-if [[ $DO_VET_STYLE -eq 1 ]]; then
-  odin_flags+=("-vet-style")
-fi
-
-odin_flags+=("-show-timings")
-odin_flags+=("-warnings-as-errors")
-odin_flags+=("${EXTRA_FLAGS[@]}")
-
-if [[ $DO_BUILD -eq 1 ]]; then
-  echo "==> Building odin-trading-tui..."
-  echo "==> odin build src -out:$OUT_BIN ${odin_flags[*]}"
-  odin build src -out:"$OUT_BIN" "${odin_flags[@]}"
-  echo "==> Build complete: $OUT_BIN"
-fi
-
-if [[ $DO_TEST -eq 1 ]]; then
-  echo "==> Testing odin-trading-tui..."
-  echo "==> odin test src ${odin_flags[*]}"
-  odin test src "${odin_flags[@]}"
-fi
-
-if [[ $DO_RUN -eq 1 ]]; then
-  echo "==> Running: $OUT_BIN"
-  exec "$OUT_BIN"
-fi
-
+case "${1:---help}" in
+    build|--build)
+        cmd_build "$2"
+        ;;
+    run|--run)
+        shift
+        cmd_run "$@"
+        ;;
+    clean|--clean)
+        cmd_clean
+        ;;
+    scenario|--scenario)
+        shift
+        cmd_scenario "$@"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        # If first arg is a number, assume it's a scenario
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            cmd_scenario "$@"
+        else
+            print_error "Unknown command: $1"
+            cmd_help
+            exit 1
+        fi
+        ;;
+esac
