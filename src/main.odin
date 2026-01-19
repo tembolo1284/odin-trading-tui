@@ -1,114 +1,217 @@
+// src/main.odin
 package main
 
 import "core:fmt"
 import "core:os"
 import "core:net"
-import "core:strconv"
 
-import "client"
-
-// ============================================================================
-// Matching Engine Test Client
-// ============================================================================
-
-DEFAULT_HOST :: "127.0.0.1"
-DEFAULT_PORT :: "1234"
+// Imports resolve via collections. build.sh maps:
+//   tui = ./src
+import "tui:client/protocol_binary"
+import "tui:client/framing"
 
 main :: proc() {
-    fmt.println("╔═══════════════════════════════════════╗")
-    fmt.println("║   Odin Matching Engine Test Client    ║")
-    fmt.println("╚═══════════════════════════════════════╝")
-    fmt.println()
+	fmt.println("=== Odin Matching Engine Client ===")
 
-    // Parse command line args
-    args := os.args
-    
-    if len(args) < 2 {
-        print_usage()
-        return
-    }
-    
-    // Parse scenario number
-    scenario_num, ok := strconv.parse_int(args[1])
-    if !ok {
-        fmt.println("Error: Invalid scenario number:", args[1])
-        print_usage()
-        return
-    }
-    
-    // Optional host:port
-    host := DEFAULT_HOST
-    port := DEFAULT_PORT
-    if len(args) >= 3 {
-        host = args[2]
-    }
-    if len(args) >= 4 {
-        port = args[3]
-    }
-    
-    // Connect
-    endpoint_str := fmt.tprintf("%s:%s", host, port)
-    fmt.println("Connecting to", endpoint_str, "...")
-    
-    ep, ep_ok := net.parse_endpoint(endpoint_str)
-    if !ep_ok {
-        fmt.println("Error: Failed to parse endpoint:", endpoint_str)
-        return
-    }
-    
-    sock, conn_err := net.dial_tcp(ep)
-    if conn_err != nil {
-        fmt.println("Error: Connection failed:", conn_err)
-        return
-    }
-    defer net.close(sock)
-    
-    fmt.println("Connected!")
-    fmt.println()
-    
-    // Get raw file descriptor for our framing functions
-    fd := socket_to_handle(sock)
-    
-    // Run scenario
-    scenario := client.Scenario(scenario_num)
-    stats, success := client.run_scenario(fd, scenario)
-    
-    fmt.println()
-    if success {
-        fmt.println("✓ Scenario completed successfully")
-    } else {
-        fmt.println("✗ Scenario failed")
-    }
-    
-    client.print_stats(&stats)
+	addr, ok := net.parse_ip4("127.0.0.1")
+	if !ok {
+		fmt.println("Failed to parse address")
+		return
+	}
+
+	ep := net.Endpoint{ip = addr, port = 1234}
+	c, err := net.tcp_connect(ep)
+	if err != os.ERROR_NONE {
+		fmt.println("Connect failed:", err)
+		return
+	}
+	defer net.tcp_close(&c)
+
+	fmt.println("Connecting to localhost:1234...")
+	fmt.println("Connected via TCP")
+	fmt.println("")
+	fmt.println("Sending test orders...")
+	fmt.println("")
+
+	payload: [protocol_binary.NEW_ORDER_WIRE_SIZE]u8
+	n, ok2 := protocol_binary.encode_new_order_binary(
+		payload[:],
+		1,      // user_id
+		"AAPL", // symbol
+		15000,  // price (u32)
+		100,    // qty
+		.Buy,   // side
+		1,      // user_order_id
+	)
+	if !ok2 {
+		fmt.println("Failed to encode new order")
+		return
+	}
+
+	if !framing.send_frame(c.fd, payload[:n]) {
+		fmt.println("Failed to send frame")
+		return
+	}
+
+	fmt.println("Sent BUY order #1: AAPL 100@150.00")
+	fmt.println("")
+	fmt.println("Waiting for server responses...")
+	fmt.println("")
+
+	recv_buf: [64 * 1024]u8
+	for {
+		payload_len, ok3 := framing.recv_frame(c.fd, recv_buf[:])
+		if !ok3 {
+			fmt.println("Disconnected / read failed")
+			return
+		}
+
+		out: protocol_binary.Output_Msg
+		_, ok4 := protocol_binary.decode_output_binary(recv_buf[:payload_len], &out)
+		if !ok4 {
+			fmt.println("Received frame, but failed to decode output message (len=", payload_len, ")")
+			continue
+		}
+
+		sym := protocol_binary.symbol_to_string(out.symbol[:])
+
+		switch out.typ {
+		case .Ack:
+			fmt.println("ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+		case .Cancel_Ack:
+			fmt.println("CANCEL_ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+		case .Trade:
+			fmt.println("TRADE: symbol=", sym,
+				" buy=", out.buy_user_id, "/", out.buy_order_id,
+				" sell=", out.sell_user_id, "/", out.sell_order_id,
+				" px=", out.price,
+				" qty=", out.quantity)
+
+		case .Top_Of_Book:
+			fmt.println("TOB: symbol=", sym,
+				" side=", u8(out.side),
+				" px=", out.price,
+				" qty=", out.quantity)
+
+		case .Reject:
+			fmt.println("REJECT: symbol=", sym,
+				" user_id=", out.user_id,
+				" order_id=", out.user_order_id,
+				" reason=", u8(out.reason))
+
+		default:
+			fmt.println("Unknown output type:", u8(out.typ))
+		}
+	}
+}
+// src/main.odin
+package main
+
+import "core:fmt"
+import "core:os"
+import "core:net"
+
+// Imports resolve via collections. build.sh maps:
+//   tui = ./src
+import "tui:client/protocol_binary"
+import "tui:client/framing"
+
+main :: proc() {
+	fmt.println("=== Odin Matching Engine Client ===")
+
+	addr, ok := net.parse_ip4("127.0.0.1")
+	if !ok {
+		fmt.println("Failed to parse address")
+		return
+	}
+
+	ep := net.Endpoint{ip = addr, port = 1234}
+	c, err := net.tcp_connect(ep)
+	if err != os.ERROR_NONE {
+		fmt.println("Connect failed:", err)
+		return
+	}
+	defer net.tcp_close(&c)
+
+	fmt.println("Connecting to localhost:1234...")
+	fmt.println("Connected via TCP")
+	fmt.println("")
+	fmt.println("Sending test orders...")
+	fmt.println("")
+
+	payload: [protocol_binary.NEW_ORDER_WIRE_SIZE]u8
+	n, ok2 := protocol_binary.encode_new_order_binary(
+		payload[:],
+		1,      // user_id
+		"AAPL", // symbol
+		15000,  // price (u32)
+		100,    // qty
+		.Buy,   // side
+		1,      // user_order_id
+	)
+	if !ok2 {
+		fmt.println("Failed to encode new order")
+		return
+	}
+
+	if !framing.send_frame(c.fd, payload[:n]) {
+		fmt.println("Failed to send frame")
+		return
+	}
+
+	fmt.println("Sent BUY order #1: AAPL 100@150.00")
+	fmt.println("")
+	fmt.println("Waiting for server responses...")
+	fmt.println("")
+
+	recv_buf: [64 * 1024]u8
+	for {
+		payload_len, ok3 := framing.recv_frame(c.fd, recv_buf[:])
+		if !ok3 {
+			fmt.println("Disconnected / read failed")
+			return
+		}
+
+		out: protocol_binary.Output_Msg
+		_, ok4 := protocol_binary.decode_output_binary(recv_buf[:payload_len], &out)
+		if !ok4 {
+			fmt.println("Received frame, but failed to decode output message (len=", payload_len, ")")
+			continue
+		}
+
+		sym := protocol_binary.symbol_to_string(out.symbol[:])
+
+		switch out.typ {
+		case .Ack:
+			fmt.println("ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+		case .Cancel_Ack:
+			fmt.println("CANCEL_ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+		case .Trade:
+			fmt.println("TRADE: symbol=", sym,
+				" buy=", out.buy_user_id, "/", out.buy_order_id,
+				" sell=", out.sell_user_id, "/", out.sell_order_id,
+				" px=", out.price,
+				" qty=", out.quantity)
+
+		case .Top_Of_Book:
+			fmt.println("TOB: symbol=", sym,
+				" side=", u8(out.side),
+				" px=", out.price,
+				" qty=", out.quantity)
+
+		case .Reject:
+			fmt.println("REJECT: symbol=", sym,
+				" user_id=", out.user_id,
+				" order_id=", out.user_order_id,
+				" reason=", u8(out.reason))
+
+		default:
+			fmt.println("Unknown output type:", u8(out.typ))
+		}
+	}
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-print_usage :: proc() {
-    fmt.println("Usage: test_client <scenario> [host] [port]")
-    fmt.println()
-    fmt.println("Scenarios:")
-    fmt.println("  1   Buy/Sell no match + Flush")
-    fmt.println("  2   Buy/Sell full match")
-    fmt.println("  3   Buy then Cancel")
-    fmt.println()
-    fmt.println("  20  Stress: 2,000 orders -> 1,000 trades (single symbol)")
-    fmt.println("  21  Stress: 20,000 orders -> 10,000 trades (single symbol)")
-    fmt.println("  22  Stress: 200,000 orders -> 100,000 trades (single symbol)")
-    fmt.println()
-    fmt.println("  30  Stress: 2,000 orders (dual symbol AAPL/TSLA)")
-    fmt.println("  31  Stress: 20,000 orders (dual symbol AAPL/TSLA)")
-    fmt.println()
-    fmt.println("Examples:")
-    fmt.println("  ./test_client 1")
-    fmt.println("  ./test_client 20 192.168.1.100 1234")
-}
-
-// Convert net.TCP_Socket to os.Handle for our framing I/O
-socket_to_handle :: proc(sock: net.TCP_Socket) -> os.Handle {
-    // net.TCP_Socket is just a wrapper around the fd
-    return os.Handle(sock)
-}
