@@ -1,150 +1,161 @@
+// src/client/framing.odin
 package client
 
 import "core:mem"
+import "core:os"
+import "core:fmt"
 
-// ============================================================================
-// TCP Length-Prefix Framing
-//
-// Format: [4-byte BIG-ENDIAN length][payload]
-// This matches your message_framing.h (network byte order)
-// ============================================================================
+FRAME_HEADER_SIZE :: 4
+MAX_FRAME_SIZE    :: 4*16384 // mirrors Zig MAX_MESSAGE_SIZE (4 * 16384)
 
-FRAME_HEADER_SIZE     :: 4
-MAX_FRAMED_MESSAGE    :: 4096
-FRAMING_BUFFER_SIZE   :: 8192
-
-// ============================================================================
-// Read State
-// ============================================================================
-
-Framing_Read_State :: struct {
-    buffer:          [FRAMING_BUFFER_SIZE]u8,
-    buffer_len:      uint,
-    msg_len:         u32,
-    header_complete: bool,
+write_u32_be :: proc(buf: []u8, v: u32) {
+    buf[0] = u8(v >> 24)
+    buf[1] = u8(v >> 16)
+    buf[2] = u8(v >> 8)
+    buf[3] = u8(v)
 }
 
-// ============================================================================
-// Write State
-// ============================================================================
-
-Framing_Write_State :: struct {
-    buffer:     [MAX_FRAMED_MESSAGE + FRAME_HEADER_SIZE]u8,
-    buffer_len: uint,
+read_u32_be :: proc(buf: []u8) -> u32 {
+    return (u32(buf[0]) << 24) | (u32(buf[1]) << 16) | (u32(buf[2]) << 8) | u32(buf[3])
 }
 
-// ============================================================================
-// Lifecycle
-// ============================================================================
-
-framing_read_init :: proc(state: ^Framing_Read_State) {
-    state^ = {}
-}
-
-framing_write_init :: proc(state: ^Framing_Write_State) {
-    state^ = {}
-}
-
-framing_read_reset :: proc(state: ^Framing_Read_State) {
-    state.buffer_len = 0
-    state.msg_len = 0
-    state.header_complete = false
-}
-
-// ============================================================================
-// Writing (add length prefix - BIG ENDIAN)
-// ============================================================================
-
-framing_encode :: proc(state: ^Framing_Write_State, payload: []u8) -> []u8 {
-    if len(payload) > MAX_FRAMED_MESSAGE {
-        return nil
+// Write exactly N bytes
+write_all :: proc(fd: os.Handle, data: []u8) -> bool {
+    sent := 0
+    for sent < len(data) {
+        n, err := os.write(fd, data[sent:])
+        if err != os.ERROR_NONE {
+            return false
+        }
+        if n <= 0 {
+            return false
+        }
+        sent += n
     }
-    
-    // Write length prefix (BIG-ENDIAN / network byte order)
-    length := u32(len(payload))
-    state.buffer[0] = u8(length >> 24)
-    state.buffer[1] = u8(length >> 16)
-    state.buffer[2] = u8(length >> 8)
-    state.buffer[3] = u8(length)
-    
-    // Copy payload
-    mem.copy(&state.buffer[FRAME_HEADER_SIZE], raw_data(payload), len(payload))
-    
-    state.buffer_len = uint(FRAME_HEADER_SIZE + len(payload))
-    return state.buffer[:state.buffer_len]
-}
-
-// ============================================================================
-// Reading
-// ============================================================================
-
-Framing_Result :: enum {
-    Complete,
-    Incomplete,
-    Error,
-}
-
-framing_feed :: proc(state: ^Framing_Read_State, data: []u8) -> bool {
-    if state.buffer_len + uint(len(data)) > FRAMING_BUFFER_SIZE {
-        return false
-    }
-    
-    mem.copy(&state.buffer[state.buffer_len], raw_data(data), len(data))
-    state.buffer_len += uint(len(data))
     return true
 }
 
-framing_try_extract :: proc(
-    state: ^Framing_Read_State,
-    out_msg: []u8,
-) -> (Framing_Result, uint) {
-    if state.buffer_len < FRAME_HEADER_SIZE {
-        return .Incomplete, 0
-    }
-    
-    // Parse length (BIG-ENDIAN / network byte order)
-    if !state.header_complete {
-        state.msg_len = (u32(state.buffer[0]) << 24) |
-                        (u32(state.buffer[1]) << 16) |
-                        (u32(state.buffer[2]) << 8) |
-                        (u32(state.buffer[3]))
-        
-        if state.msg_len > MAX_FRAMED_MESSAGE {
-            return .Error, 0
+// Read exactly N bytes
+read_exact :: proc(fd: os.Handle, buf: []u8) -> bool {
+    got := 0
+    for got < len(buf) {
+        n, err := os.read(fd, buf[got:])
+        if err != os.ERROR_NONE {
+            return false
         }
-        
-        state.header_complete = true
+        if n <= 0 {
+            return false
+        }
+        got += n
     }
-    
-    total_needed := uint(FRAME_HEADER_SIZE) + uint(state.msg_len)
-    
-    if state.buffer_len < total_needed {
-        return .Incomplete, 0
-    }
-    
-    if uint(len(out_msg)) < uint(state.msg_len) {
-        return .Error, 0
-    }
-    
-    msg_len := uint(state.msg_len)
-    mem.copy(raw_data(out_msg), &state.buffer[FRAME_HEADER_SIZE], int(msg_len))
-    
-    // Shift remaining data
-    remaining := state.buffer_len - total_needed
-    if remaining > 0 {
-        mem.copy(&state.buffer[0], &state.buffer[total_needed], int(remaining))
-    }
-    state.buffer_len = remaining
-    state.header_complete = false
-    state.msg_len = 0
-    
-    return .Complete, msg_len
+    return true
 }
 
-framing_has_pending :: proc(state: ^Framing_Read_State) -> bool {
-    return state.buffer_len >= FRAME_HEADER_SIZE
+// Send one framed payload: [u32be length][payload]
+send_frame :: proc(fd: os.Handle, payload: []u8) -> bool {
+    if len(payload) > int(MAX_FRAME_SIZE) {
+        return false
+    }
+
+    hdr: [FRAME_HEADER_SIZE]u8
+    write_u32_be(hdr[:], u32(len(payload)))
+
+    if !write_all(fd, hdr[:]) { return false }
+    if !write_all(fd, payload) { return false }
+    return true
 }
 
-framing_buffer_used :: proc(state: ^Framing_Read_State) -> uint {
-    return state.buffer_len
+// Receive one framed payload. Returns (payload_len, ok).
+// Caller provides a scratch buffer; payload is written into scratch[0..len].
+recv_frame :: proc(fd: os.Handle, scratch: []u8) -> (payload_len: int, ok: bool) {
+    hdr: [FRAME_HEADER_SIZE]u8
+    if !read_exact(fd, hdr[:]) { return 0, false }
+
+    n := read_u32_be(hdr[:])
+    if n == 0 || n > MAX_FRAME_SIZE { return 0, false }
+    if int(n) > len(scratch) { return 0, false }
+
+    if !read_exact(fd, scratch[:int(n)]) { return 0, false }
+    return int(n), true
 }
+// src/client/framing.odin
+package client
+
+import "core:mem"
+import "core:os"
+import "core:fmt"
+
+FRAME_HEADER_SIZE :: 4
+MAX_FRAME_SIZE    :: 4*16384 // mirrors Zig MAX_MESSAGE_SIZE (4 * 16384)
+
+write_u32_be :: proc(buf: []u8, v: u32) {
+    buf[0] = u8(v >> 24)
+    buf[1] = u8(v >> 16)
+    buf[2] = u8(v >> 8)
+    buf[3] = u8(v)
+}
+
+read_u32_be :: proc(buf: []u8) -> u32 {
+    return (u32(buf[0]) << 24) | (u32(buf[1]) << 16) | (u32(buf[2]) << 8) | u32(buf[3])
+}
+
+// Write exactly N bytes
+write_all :: proc(fd: os.Handle, data: []u8) -> bool {
+    sent := 0
+    for sent < len(data) {
+        n, err := os.write(fd, data[sent:])
+        if err != os.ERROR_NONE {
+            return false
+        }
+        if n <= 0 {
+            return false
+        }
+        sent += n
+    }
+    return true
+}
+
+// Read exactly N bytes
+read_exact :: proc(fd: os.Handle, buf: []u8) -> bool {
+    got := 0
+    for got < len(buf) {
+        n, err := os.read(fd, buf[got:])
+        if err != os.ERROR_NONE {
+            return false
+        }
+        if n <= 0 {
+            return false
+        }
+        got += n
+    }
+    return true
+}
+
+// Send one framed payload: [u32be length][payload]
+send_frame :: proc(fd: os.Handle, payload: []u8) -> bool {
+    if len(payload) > int(MAX_FRAME_SIZE) {
+        return false
+    }
+
+    hdr: [FRAME_HEADER_SIZE]u8
+    write_u32_be(hdr[:], u32(len(payload)))
+
+    if !write_all(fd, hdr[:]) { return false }
+    if !write_all(fd, payload) { return false }
+    return true
+}
+
+// Receive one framed payload. Returns (payload_len, ok).
+// Caller provides a scratch buffer; payload is written into scratch[0..len].
+recv_frame :: proc(fd: os.Handle, scratch: []u8) -> (payload_len: int, ok: bool) {
+    hdr: [FRAME_HEADER_SIZE]u8
+    if !read_exact(fd, hdr[:]) { return 0, false }
+
+    n := read_u32_be(hdr[:])
+    if n == 0 || n > MAX_FRAME_SIZE { return 0, false }
+    if int(n) > len(scratch) { return 0, false }
+
+    if !read_exact(fd, scratch[:int(n)]) { return 0, false }
+    return int(n), true
+}
+

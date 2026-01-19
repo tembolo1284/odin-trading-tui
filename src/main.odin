@@ -1,84 +1,217 @@
+// src/main.odin
 package main
 
 import "core:fmt"
-import "core:time"
 import "core:os"
-
-import "client"
-
-// Response callback - print received messages
-on_response :: proc(msg: ^client.Output_Msg, user_data: rawptr) {
-    c := cast(^client.Codec)user_data
-    fmt.println(client.codec_format_output(c, msg))
-}
+import "core:net"
+import "client/protocol_binary"
+import "client/framing"
 
 main :: proc() {
     fmt.println("=== Odin Matching Engine Client ===")
-    fmt.println()
-    
-    // Configuration
-    config := client.default_config()
-    config.host = "localhost"
-    config.port = 1234           // Your TCP port
-    config.transport_type = .Tcp
-    config.encoding_type = .Binary
-    config.user_id = 1
-    
-    // Initialize client
-    c: client.Engine_Client
-    client.engine_client_init(&c, &config)
-    
-    // Set response callback
-    client.engine_client_set_response_callback(&c, on_response, &c.codec)
-    
+
     // Connect
-    if !client.engine_client_connect(&c) {
-        fmt.eprintln("Failed to connect to matching engine")
-        os.exit(1)
+    addr, ok := net.parse_ip4("127.0.0.1")
+    if !ok {
+        fmt.println("Failed to parse address")
+        return
     }
-    defer client.engine_client_disconnect(&c)
-    
-    fmt.println()
+
+    ep := net.Endpoint{ip = addr, port = 1234}
+    c, err := net.tcp_connect(ep)
+    if err != os.ERROR_NONE {
+        fmt.println("Connect failed:", err)
+        return
+    }
+    defer net.tcp_close(&c)
+
+    fmt.println("Connecting to localhost:1234...")
+    fmt.println("Connected via TCP")
+    fmt.println("")
     fmt.println("Sending test orders...")
-    fmt.println()
-    
-    // Send a BUY order
-    order1 := client.engine_client_send_order(&c, "AAPL", 15000, 100, .Buy)
-    if order1 > 0 {
-        fmt.printf("Sent BUY order #%d: AAPL 100@150.00\n", order1)
+    fmt.println("")
+
+    // Build one NewOrder payload (Zig expects framed payload)
+    payload: [protocol_binary.NEW_ORDER_WIRE_SIZE]u8
+    n, ok2 := protocol_binary.encode_new_order_binary(
+        payload[:],
+        1,              // user_id
+        "AAPL",         // symbol
+        15000,          // price (u32) - NOTE: use your price scaling consistently
+        100,            // qty
+        .Buy,           // side
+        1,              // user_order_id
+    )
+    if !ok2 {
+        fmt.println("Failed to encode new order")
+        return
     }
-    
-    // Wait for response
-    time.sleep(100 * time.Millisecond)
-    client.engine_client_poll(&c)
-    
-    // Send a SELL order (should match)
-    order2 := client.engine_client_send_order(&c, "AAPL", 15000, 50, .Sell)
-    if order2 > 0 {
-        fmt.printf("Sent SELL order #%d: AAPL 50@150.00\n", order2)
+
+    if !framing.send_frame(c.fd, payload[:n]) {
+        fmt.println("Failed to send frame")
+        return
     }
-    
-    // Wait for responses
-    time.sleep(100 * time.Millisecond)
-    client.engine_client_poll(&c)
-    
-    // Send another BUY
-    order3 := client.engine_client_send_order(&c, "MSFT", 40000, 200, .Buy)
-    if order3 > 0 {
-        fmt.printf("Sent BUY order #%d: MSFT 200@400.00\n", order3)
+
+    fmt.println("Sent BUY order #1: AAPL 100@150.00")
+    fmt.println("")
+    fmt.println("Waiting for server responses...")
+    fmt.println("")
+
+    // Receive loop
+    recv_buf: [64*1024]u8
+    for {
+        payload_len, ok3 := framing.recv_frame(c.fd, recv_buf[:])
+        if !ok3 {
+            fmt.println("Disconnected / read failed")
+            return
+        }
+
+        var out: protocol_binary.Output_Msg
+        _, ok4 := protocol_binary.decode_output_binary(recv_buf[:payload_len], &out)
+        if !ok4 {
+            fmt.println("Received frame, but failed to decode output message (len=", payload_len, ")")
+            continue
+        }
+
+        sym := protocol_binary.symbol_to_string(out.symbol[:])
+
+        switch out.typ {
+        case .Ack:
+            fmt.println("ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+        case .Cancel_Ack:
+            fmt.println("CANCEL_ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+        case .Trade:
+            fmt.println("TRADE: symbol=", sym,
+                " buy=", out.buy_user_id, "/", out.buy_order_id,
+                " sell=", out.sell_user_id, "/", out.sell_order_id,
+                " px=", out.price,
+                " qty=", out.quantity)
+
+        case .Top_Of_Book:
+            fmt.println("TOB: symbol=", sym,
+                " side=", u8(out.side),
+                " px=", out.price,
+                " qty=", out.quantity)
+
+        case .Reject:
+            fmt.println("REJECT: symbol=", sym,
+                " user_id=", out.user_id,
+                " order_id=", out.user_order_id,
+                " reason=", u8(out.reason))
+
+        default:
+            fmt.println("Unknown output type:", u8(out.typ))
+        }
     }
-    
-    time.sleep(100 * time.Millisecond)
-    client.engine_client_poll(&c)
-    
-    // Cancel order 3
-    if client.engine_client_send_cancel(&c, order3, "MSFT") {
-        fmt.printf("Sent CANCEL for order #%d\n", order3)
-    }
-    
-    time.sleep(100 * time.Millisecond)
-    client.engine_client_poll(&c)
-    
-    fmt.println()
-    client.engine_client_print_stats(&c)
 }
+// src/main.odin
+package main
+
+import "core:fmt"
+import "core:os"
+import "core:net"
+import "client/protocol_binary"
+import "client/framing"
+
+main :: proc() {
+    fmt.println("=== Odin Matching Engine Client ===")
+
+    // Connect
+    addr, ok := net.parse_ip4("127.0.0.1")
+    if !ok {
+        fmt.println("Failed to parse address")
+        return
+    }
+
+    ep := net.Endpoint{ip = addr, port = 1234}
+    c, err := net.tcp_connect(ep)
+    if err != os.ERROR_NONE {
+        fmt.println("Connect failed:", err)
+        return
+    }
+    defer net.tcp_close(&c)
+
+    fmt.println("Connecting to localhost:1234...")
+    fmt.println("Connected via TCP")
+    fmt.println("")
+    fmt.println("Sending test orders...")
+    fmt.println("")
+
+    // Build one NewOrder payload (Zig expects framed payload)
+    payload: [protocol_binary.NEW_ORDER_WIRE_SIZE]u8
+    n, ok2 := protocol_binary.encode_new_order_binary(
+        payload[:],
+        1,              // user_id
+        "AAPL",         // symbol
+        15000,          // price (u32) - NOTE: use your price scaling consistently
+        100,            // qty
+        .Buy,           // side
+        1,              // user_order_id
+    )
+    if !ok2 {
+        fmt.println("Failed to encode new order")
+        return
+    }
+
+    if !framing.send_frame(c.fd, payload[:n]) {
+        fmt.println("Failed to send frame")
+        return
+    }
+
+    fmt.println("Sent BUY order #1: AAPL 100@150.00")
+    fmt.println("")
+    fmt.println("Waiting for server responses...")
+    fmt.println("")
+
+    // Receive loop
+    recv_buf: [64*1024]u8
+    for {
+        payload_len, ok3 := framing.recv_frame(c.fd, recv_buf[:])
+        if !ok3 {
+            fmt.println("Disconnected / read failed")
+            return
+        }
+
+        var out: protocol_binary.Output_Msg
+        _, ok4 := protocol_binary.decode_output_binary(recv_buf[:payload_len], &out)
+        if !ok4 {
+            fmt.println("Received frame, but failed to decode output message (len=", payload_len, ")")
+            continue
+        }
+
+        sym := protocol_binary.symbol_to_string(out.symbol[:])
+
+        switch out.typ {
+        case .Ack:
+            fmt.println("ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+        case .Cancel_Ack:
+            fmt.println("CANCEL_ACK: symbol=", sym, " user_id=", out.user_id, " order_id=", out.user_order_id)
+
+        case .Trade:
+            fmt.println("TRADE: symbol=", sym,
+                " buy=", out.buy_user_id, "/", out.buy_order_id,
+                " sell=", out.sell_user_id, "/", out.sell_order_id,
+                " px=", out.price,
+                " qty=", out.quantity)
+
+        case .Top_Of_Book:
+            fmt.println("TOB: symbol=", sym,
+                " side=", u8(out.side),
+                " px=", out.price,
+                " qty=", out.quantity)
+
+        case .Reject:
+            fmt.println("REJECT: symbol=", sym,
+                " user_id=", out.user_id,
+                " order_id=", out.user_order_id,
+                " reason=", u8(out.reason))
+
+        default:
+            fmt.println("Unknown output type:", u8(out.typ))
+        }
+    }
+}
+
