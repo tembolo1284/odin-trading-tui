@@ -201,7 +201,7 @@ decode_output_binary :: proc(data: []u8, out: ^Output_Msg) -> (consumed: int, ok
         out.reason = Reject_Reason(data[pos]); pos += 1
         return pos, true
 
-    default:
+    case:
         return 0, false
     }
 }
