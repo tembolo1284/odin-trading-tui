@@ -58,16 +58,17 @@ transport_connect :: proc(
     t.port = port
     t.connect_timeout_ms = timeout_ms
     copy_host(t.host[:], host)
-    
+
     ep, ok := resolve_endpoint(host, port)
     if !ok {
+        fmt.eprintln("Failed to resolve host:", host)
         t.state = .Error
         return false
     }
     t.endpoint = ep
-    
+
     actual_type := type
-    
+
     // Auto-detect: try TCP first
     if type == .Auto {
         t.state = .Connecting
@@ -77,7 +78,7 @@ transport_connect :: proc(
             actual_type = .Udp
         }
     }
-    
+
     if actual_type == .Tcp {
         if t.state != .Connected {
             if !try_tcp_connect(t, timeout_ms) {
@@ -93,7 +94,7 @@ transport_connect :: proc(
         }
         t.type = .Udp
     }
-    
+
     t.state = .Connected
     return true
 }
@@ -113,23 +114,16 @@ transport_disconnect :: proc(t: ^Transport) {
 // ============================================================================
 
 try_tcp_connect :: proc(t: ^Transport, timeout_ms: u32) -> bool {
-    sock, err := net.create_socket(.IP4, .TCP)
+    // Create and connect TCP socket
+    sock, err := net.dial_tcp(t.endpoint)
     if err != nil {
-        fmt.eprintln("Failed to create TCP socket:", err)
+        fmt.eprintln("Failed to connect:", err)
         return false
     }
-    
+
     // TCP_NODELAY
     net.set_option(sock, .TCP_Nodelay, true)
-    
-    // Connect
-    connect_err := net.connect(sock, t.endpoint)
-    if connect_err != nil {
-        fmt.eprintln("Failed to connect:", connect_err)
-        net.close(sock)
-        return false
-    }
-    
+
     t.socket = sock
     t.state = .Connected
     return true
@@ -140,12 +134,13 @@ try_tcp_connect :: proc(t: ^Transport, timeout_ms: u32) -> bool {
 // ============================================================================
 
 try_udp_connect :: proc(t: ^Transport) -> bool {
-    sock, err := net.create_socket(.IP4, .UDP)
+    // For UDP we just create a socket, no real "connection"
+    sock, err := net.make_unbound_udp_socket(.IP4)
     if err != nil {
         fmt.eprintln("Failed to create UDP socket:", err)
         return false
     }
-    
+
     t.udp_socket = sock
     return true
 }
@@ -158,7 +153,7 @@ transport_send :: proc(t: ^Transport, data: []u8) -> bool {
     if t.state != .Connected {
         return false
     }
-    
+
     if t.type == .Tcp {
         return tcp_send_framed(t, data)
     } else {
@@ -171,31 +166,32 @@ tcp_send_framed :: proc(t: ^Transport, data: []u8) -> bool {
     if framed == nil {
         return false
     }
-    
-    sent := 0
-    for sent < len(framed) {
-        n, err := net.send(t.socket, framed[sent:])
+
+    // Send all bytes
+    total_sent := 0
+    for total_sent < len(framed) {
+        sent, err := net.send_tcp(t.socket, framed[total_sent:])
         if err != nil {
             fmt.eprintln("Send error:", err)
             t.state = .Error
             return false
         }
-        sent += n
+        total_sent += sent
     }
-    
+
     t.bytes_sent += u64(len(framed))
     t.messages_sent += 1
     return true
 }
 
 udp_send :: proc(t: ^Transport, data: []u8) -> bool {
-    n, err := net.send_to(t.udp_socket, data, t.endpoint)
+    sent, err := net.send_udp(t.udp_socket, data, t.endpoint)
     if err != nil {
         fmt.eprintln("UDP send error:", err)
         return false
     }
-    
-    t.bytes_sent += u64(n)
+
+    t.bytes_sent += u64(sent)
     t.messages_sent += 1
     return true
 }
@@ -212,7 +208,7 @@ transport_recv :: proc(
     if t.state != .Connected {
         return -1
     }
-    
+
     if t.type == .Tcp {
         return tcp_recv_framed(t, buffer, timeout_ms)
     } else {
@@ -232,31 +228,28 @@ tcp_recv_framed :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> int {
         t.state = .Error
         return -1
     }
-    
+
     // Need more data
     recv_buf: [4096]u8
-    n, err := net.recv(t.socket, recv_buf[:])
+    bytes_read, err := net.recv_tcp(t.socket, recv_buf[:])
     if err != nil {
-        // Check for timeout/would block
-        if err == net.TCP_Recv_Error.Timeout {
-            return 0
-        }
+        // For non-blocking, this would be "would block"
         fmt.eprintln("Recv error:", err)
         t.state = .Error
         return -1
     }
-    
-    if n == 0 {
+
+    if bytes_read == 0 {
         t.state = .Disconnected
         return -1
     }
-    
+
     // Feed to framing
-    if !framing_feed(&t.read_state, recv_buf[:n]) {
+    if !framing_feed(&t.read_state, recv_buf[:bytes_read]) {
         t.state = .Error
         return -1
     }
-    
+
     // Try extract again
     result, msg_len = framing_try_extract(&t.read_state, buffer)
     if result == .Complete {
@@ -268,19 +261,19 @@ tcp_recv_framed :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> int {
         t.state = .Error
         return -1
     }
-    
+
     return 0  // Incomplete
 }
 
 udp_recv :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> int {
-    n, _, err := net.recv_from(t.udp_socket, buffer)
+    bytes_read, _, err := net.recv_udp(t.udp_socket, buffer)
     if err != nil {
         return 0
     }
-    
-    t.bytes_received += u64(n)
+
+    t.bytes_received += u64(bytes_read)
     t.messages_received += 1
-    return n
+    return bytes_read
 }
 
 // ============================================================================
@@ -312,23 +305,32 @@ copy_host :: proc(dest: []u8, src: string) {
 
 resolve_endpoint :: proc(host: string, port: u16) -> (net.Endpoint, bool) {
     // Try parsing as IP first
-    addr, ok := net.parse_address(host)
-    if ok {
-        return net.Endpoint{addr, int(port)}, true
+    addr4, ok4 := net.parse_ip4_address(host)
+    if ok4 {
+        return net.Endpoint{net.IP4_Address(addr4), int(port)}, true
     }
-    
+
     // Try localhost specially
     if host == "localhost" {
-        addr4 := net.IP4_Address{127, 0, 0, 1}
-        return net.Endpoint{addr4, int(port)}, true
+        return net.Endpoint{net.IP4_Address{127, 0, 0, 1}, int(port)}, true
     }
-    
-    // Try DNS resolution
-    addrs, err := net.resolve(host)
-    if err != nil || len(addrs) == 0 {
+
+    // DNS resolution (Odin dev-2026: returns (ep4, ep6, err))
+    ep4, ep6, err := net.resolve(host)
+    if err != nil {
         return {}, false
     }
-    defer delete(addrs)
-    
-    return net.Endpoint{addrs[0], int(port)}, true
+
+    // Prefer IPv4, fall back to IPv6
+    ep := ep4
+    if ep.address == {} {
+        ep = ep6
+    }
+    if ep.address == {} {
+        return {}, false
+    }
+
+    ep.port = int(port)
+    return ep, true
 }
+
