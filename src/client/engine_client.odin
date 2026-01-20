@@ -466,8 +466,9 @@ probe_server_encoding :: proc(client: ^Engine_Client) -> bool {
     saved_encoding := client.codec.send_encoding
     client.codec.send_encoding = .Binary
 
-    // Send probe order
-    data := codec_encode_new_order(&client.codec, cfg.user_id, "ZPROBE", 1, 1, .Buy, 1)
+    // Send a cancel for a non-existent order - server will always respond
+    // This is safer than sending an order which might not get a response
+    data := codec_encode_cancel(&client.codec, cfg.user_id, 999999)
     if data == nil {
         client.codec.send_encoding = saved_encoding
         return false
@@ -490,15 +491,6 @@ probe_server_encoding :: proc(client: ^Engine_Client) -> bool {
     client.codec.detected_encoding = cfg.detected_encoding
     client.codec.send_encoding = cfg.detected_encoding
     client.codec.encoding_detected = true
-
-    // Send flush to clear probe
-    flush_data := codec_encode_flush(&client.codec)
-    if flush_data != nil {
-        transport_send(&client.transport, flush_data)
-    }
-
-    // Drain responses
-    drain_transport(client, 500)
 
     client.codec.send_encoding = saved_encoding
     return true

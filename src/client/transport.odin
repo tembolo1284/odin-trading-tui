@@ -10,7 +10,6 @@ package client
 import "core:fmt"
 import "core:mem"
 import "core:net"
-import "core:time"
 
 // =============================================================================
 // Constants
