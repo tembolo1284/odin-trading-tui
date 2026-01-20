@@ -1,28 +1,22 @@
 package client
-
 // =============================================================================
 // Multicast Receiver
 //
 // For subscribing to market data multicast feeds.
 // =============================================================================
-
 import "core:fmt"
 import "core:net"
-import "core:sys/posix"
 
 // =============================================================================
 // Multicast Receiver State
 // =============================================================================
-
 Multicast_Receiver :: struct {
     socket:     net.UDP_Socket,
     group:      [64]u8,
     port:       u16,
     joined:     bool,
-
     // Receive buffer
     recv_buffer: [TRANSPORT_RECV_BUFFER_SIZE]u8,
-
     // Statistics
     packets_received: u64,
     bytes_received:   u64,
@@ -31,7 +25,6 @@ Multicast_Receiver :: struct {
 // =============================================================================
 // Multicast API
 // =============================================================================
-
 multicast_receiver_init :: proc(m: ^Multicast_Receiver) {
     m^ = {}
     m.joined = false
@@ -42,43 +35,30 @@ multicast_receiver_join :: proc(m: ^Multicast_Receiver, group: string, port: u16
     copy_symbol(m.group[:], group)
     m.port = port
 
-    // Create UDP socket
-    sock, err := net.create_socket(.IP4, .UDP)
+    // Create bound UDP socket
+    bind_addr := net.IP4_Address{0, 0, 0, 0}
+    sock, err := net.make_bound_udp_socket(bind_addr, int(port))
     if err != nil {
-        fmt.eprintln("multicast socket error")
+        fmt.eprintln("multicast socket/bind error")
         return false
     }
 
     // Allow multiple subscribers
     net.set_option(sock, .Reuse_Address, true)
 
-    // Bind to port
-    bind_addr := net.Endpoint{
-        address = net.IP4_Address{0, 0, 0, 0},
-        port = int(port),
-    }
-
-    bind_err := net.bind(sock, bind_addr)
-    if bind_err != nil {
-        fmt.eprintln("multicast bind error")
-        net.close(sock)
-        return false
-    }
-
     // Join multicast group would require platform-specific setsockopt
     // This is a simplified implementation
-    // In production, use IP_ADD_MEMBERSHIP
+    // In production, use IP_ADD_MEMBERSHIP via foreign bindings
 
-    m.socket = net.UDP_Socket(sock)
+    m.socket = sock
     m.joined = true
-
     return true
 }
 
 // Leave multicast group
 multicast_receiver_leave :: proc(m: ^Multicast_Receiver) {
     if m.joined {
-        net.close(net.any_socket(m.socket))
+        net.close(m.socket)
         m.joined = false
     }
 }
@@ -94,12 +74,12 @@ multicast_receiver_recv :: proc(
     }
 
     if timeout_ms == 0 {
-        net.set_blocking(net.any_socket(m.socket), false)
+        net.set_blocking(m.socket, false)
     } else {
-        net.set_blocking(net.any_socket(m.socket), true)
+        net.set_blocking(m.socket, true)
     }
 
-    received, _, err := net.recv_from(m.socket, buffer)
+    received, _, err := net.recv_udp(m.socket, buffer)
     if err != nil || received <= 0 {
         return nil, false
     }

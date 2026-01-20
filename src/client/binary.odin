@@ -8,7 +8,7 @@ package client
 // =============================================================================
 
 import "core:mem"
-import "core:intrinsics"
+import "base:intrinsics"
 
 // =============================================================================
 // Binary Message Types

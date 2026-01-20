@@ -1,20 +1,16 @@
 package client
-
 // =============================================================================
 // CSV Protocol
 //
 // Human-readable message format for debugging and testing.
 // =============================================================================
-
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
-import "core:unicode/utf8"
 
 // =============================================================================
 // Encoding Functions
 // =============================================================================
-
 // Encode a new order to CSV format
 // Returns number of bytes written
 csv_encode_new_order :: proc(
@@ -50,7 +46,6 @@ csv_encode_flush :: proc(buffer: []u8) -> int {
 // =============================================================================
 // Decoding Functions
 // =============================================================================
-
 // Helper to trim whitespace from beginning of string
 trim_left :: proc(s: string) -> string {
     i := 0
@@ -69,6 +64,15 @@ trim_right :: proc(s: string) -> string {
     return s[:i]
 }
 
+// Helper to parse uint from string - returns (value, ok)
+parse_uint_safe :: proc(s: string) -> (u32, bool) {
+    val, ok := strconv.parse_int(s)
+    if !ok || val < 0 {
+        return 0, false
+    }
+    return u32(val), true
+}
+
 // Parse a CSV response message
 // Format: A, symbol, userId, orderId
 //         C, symbol, userId, orderId
@@ -77,7 +81,6 @@ trim_right :: proc(s: string) -> string {
 csv_decode_response :: proc(data: []u8, msg: ^Output_Msg) -> bool {
     line := string(data)
     line = trim_right(line)
-
     if len(line) == 0 {
         return false
     }
@@ -99,20 +102,18 @@ csv_decode_response :: proc(data: []u8, msg: ^Output_Msg) -> bool {
     case 'A':
         // A, symbol, userId, orderId
         if len(parts) < 4 do return false
-
         msg.type = .Ack
         ack: Ack_Msg
-
         sym := trim_left(parts[1])
         copy_symbol(ack.symbol[:], sym)
 
-        uid, ok1 := strconv.parse_uint(trim_left(parts[2]), 10)
+        uid, ok1 := parse_uint_safe(trim_left(parts[2]))
         if !ok1 do return false
-        ack.user_id = u32(uid)
+        ack.user_id = uid
 
-        oid, ok2 := strconv.parse_uint(trim_left(parts[3]), 10)
+        oid, ok2 := parse_uint_safe(trim_left(parts[3]))
         if !ok2 do return false
-        ack.user_order_id = u32(oid)
+        ack.user_order_id = oid
 
         msg.data = ack
         return true
@@ -120,20 +121,18 @@ csv_decode_response :: proc(data: []u8, msg: ^Output_Msg) -> bool {
     case 'C':
         // C, symbol, userId, orderId (Cancel Ack)
         if len(parts) < 4 do return false
-
         msg.type = .Cancel_Ack
         cack: Cancel_Ack_Msg
-
         sym := trim_left(parts[1])
         copy_symbol(cack.symbol[:], sym)
 
-        uid, ok1 := strconv.parse_uint(trim_left(parts[2]), 10)
+        uid, ok1 := parse_uint_safe(trim_left(parts[2]))
         if !ok1 do return false
-        cack.user_id = u32(uid)
+        cack.user_id = uid
 
-        oid, ok2 := strconv.parse_uint(trim_left(parts[3]), 10)
+        oid, ok2 := parse_uint_safe(trim_left(parts[3]))
         if !ok2 do return false
-        cack.user_order_id = u32(oid)
+        cack.user_order_id = oid
 
         msg.data = cack
         return true
@@ -141,37 +140,34 @@ csv_decode_response :: proc(data: []u8, msg: ^Output_Msg) -> bool {
     case 'T':
         // T, symbol, buyUser, buyOrd, sellUser, sellOrd, price, qty
         if len(parts) < 8 do return false
-
         msg.type = .Trade
         trade: Trade_Msg
-
         sym := trim_left(parts[1])
         copy_symbol(trade.symbol[:], sym)
 
-        v, ok: uint
-        v, ok = strconv.parse_uint(trim_left(parts[2]), 10)
-        if !ok do return false
-        trade.user_id_buy = u32(v)
+        v1, ok1 := parse_uint_safe(trim_left(parts[2]))
+        if !ok1 do return false
+        trade.user_id_buy = v1
 
-        v, ok = strconv.parse_uint(trim_left(parts[3]), 10)
-        if !ok do return false
-        trade.user_order_id_buy = u32(v)
+        v2, ok2 := parse_uint_safe(trim_left(parts[3]))
+        if !ok2 do return false
+        trade.user_order_id_buy = v2
 
-        v, ok = strconv.parse_uint(trim_left(parts[4]), 10)
-        if !ok do return false
-        trade.user_id_sell = u32(v)
+        v3, ok3 := parse_uint_safe(trim_left(parts[4]))
+        if !ok3 do return false
+        trade.user_id_sell = v3
 
-        v, ok = strconv.parse_uint(trim_left(parts[5]), 10)
-        if !ok do return false
-        trade.user_order_id_sell = u32(v)
+        v4, ok4 := parse_uint_safe(trim_left(parts[5]))
+        if !ok4 do return false
+        trade.user_order_id_sell = v4
 
-        v, ok = strconv.parse_uint(trim_left(parts[6]), 10)
-        if !ok do return false
-        trade.price = u32(v)
+        v5, ok5 := parse_uint_safe(trim_left(parts[6]))
+        if !ok5 do return false
+        trade.price = v5
 
-        v, ok = strconv.parse_uint(trim_left(parts[7]), 10)
-        if !ok do return false
-        trade.quantity = u32(v)
+        v6, ok6 := parse_uint_safe(trim_left(parts[7]))
+        if !ok6 do return false
+        trade.quantity = v6
 
         msg.data = trade
         return true
@@ -179,10 +175,8 @@ csv_decode_response :: proc(data: []u8, msg: ^Output_Msg) -> bool {
     case 'B':
         // B, symbol, side, price, qty  (or B, symbol, side, -, -)
         if len(parts) < 5 do return false
-
         msg.type = .Top_Of_Book
         tob: Top_Of_Book_Msg
-
         sym := trim_left(parts[1])
         copy_symbol(tob.symbol[:], sym)
 
@@ -195,18 +189,18 @@ csv_decode_response :: proc(data: []u8, msg: ^Output_Msg) -> bool {
         if price_str == "-" {
             tob.price = 0
         } else {
-            v, ok := strconv.parse_uint(price_str, 10)
-            if !ok do return false
-            tob.price = u32(v)
+            pv, pok := parse_uint_safe(price_str)
+            if !pok do return false
+            tob.price = pv
         }
 
         qty_str := trim_left(parts[4])
         if qty_str == "-" {
             tob.total_quantity = 0
         } else {
-            v, ok := strconv.parse_uint(qty_str, 10)
-            if !ok do return false
-            tob.total_quantity = u32(v)
+            qv, qok := parse_uint_safe(qty_str)
+            if !qok do return false
+            tob.total_quantity = qv
         }
 
         msg.data = tob
