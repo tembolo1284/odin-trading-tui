@@ -3,7 +3,6 @@ package client
 import "core:fmt"
 import "core:os"
 import "core:strconv"
-import "core:strings"
 
 print_usage :: proc(progname: string) {
     fmt.printf("Usage: %s <host> <port> [scenario] [options]\n\n", progname)
@@ -62,7 +61,7 @@ main :: proc() {
         } else if arg == "--danger-burst" {
             config.danger_burst = true
         } else if scenario_id == 0 {
-            if id, ok := strconv.parse_int(arg, 10); ok && id > 0 {
+            if id, ok2 := strconv.parse_int(arg, 10); ok2 && id > 0 {
                 scenario_id = int(id)
                 config.mode = .Scenario
                 config.scenario_id = scenario_id

@@ -360,7 +360,7 @@ engine_client_poll :: proc(client: ^Engine_Client) -> int {
 
     // Poll TCP/UDP
     if client.connected && client.config.mode != .Multicast_Only {
-        for i in 0..<MAX_RECV_ATTEMPTS {
+        for _ in 0..<MAX_RECV_ATTEMPTS {
             if !transport_has_data(&client.transport) {
                 break
             }
@@ -377,7 +377,7 @@ engine_client_poll :: proc(client: ^Engine_Client) -> int {
 
     // Poll multicast
     if client.multicast_active {
-        for i in 0..<MAX_RECV_ATTEMPTS {
+        for _ in 0..<MAX_RECV_ATTEMPTS {
             data, ok := multicast_receiver_recv(&client.multicast, buffer[:], 0)
             if !ok {
                 break
@@ -508,7 +508,7 @@ drain_transport :: proc(client: ^Engine_Client, timeout_ms: int) {
     buf: [4096]u8
     empty_count := 0
 
-    for i in 0..<MAX_DRAIN_ITERATIONS {
+    for _ in 0..<MAX_DRAIN_ITERATIONS {
         if transport_has_data(&client.transport) {
             _, ok := transport_recv(&client.transport, buf[:], 0)
             if ok {

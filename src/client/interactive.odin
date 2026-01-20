@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:strconv"
-import "core:bufio"
 
 Interactive_Options :: struct {
     show_prompt:     bool,

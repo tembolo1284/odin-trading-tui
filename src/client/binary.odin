@@ -7,7 +7,6 @@ package client
 // All multi-byte integers are network byte order (big-endian).
 // =============================================================================
 
-import "core:mem"
 import "base:intrinsics"
 
 // =============================================================================
