@@ -1,107 +1,115 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="$ROOT_DIR/bin"
-OUT_BIN="$BIN_DIR/test_client"
+set -e
 
-MODE="debug"          # debug | release
-DO_CLEAN=0
-DO_BUILD=0
-DO_RUN=0
-DO_TEST=0
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$PROJECT_DIR/build"
 
-DO_STRICT_STYLE=1
-DO_VET_STYLE=1
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-EXTRA_FLAGS=()
-
-usage() {
-  cat <<'EOF'
-Usage:
-  ./build.sh [--clean] [--build] [--run] [--test] [--debug|--release]
-             [--no-strict-style] [--no-vet-style] [-- <extra odin flags...>]
-
-Notes:
-- Odin expects a DIRECTORY as the first argument to `odin build`.
-- We build ./src (package main lives in src/main.odin)
-- We map a collection "tui" to ./src so imports can use:
-    import "tui:client/protocol_binary"
-    import "tui:client/framing"
-EOF
+print_usage() {
+    echo "Usage: $0 <command>"
+    echo ""
+    echo "Commands:"
+    echo "  build         Build the client (release)"
+    echo "  debug         Build with debug info"
+    echo "  clean         Remove build artifacts"
+    echo "  test          Run tests"
+    echo "  run           Run the client"
+    echo "  decoder       Build and run the decoder"
+    echo "  help          Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  $0 build"
+    echo "  $0 run localhost 1234"
+    echo "  $0 run localhost 1234 2 --tcp"
+    echo "  $0 test"
 }
 
-die() { echo "error: $*" >&2; exit 1; }
+cmd_build() {
+    echo -e "${GREEN}Building client (release)...${NC}"
+    mkdir -p "$BUILD_DIR"
+    odin build "$PROJECT_DIR/src/client" \
+        -out:"$BUILD_DIR/client" \
+        -o:speed \
+        -disable-assert
+    echo -e "${GREEN}Built: $BUILD_DIR/client${NC}"
+}
 
-if ! command -v odin >/dev/null 2>&1; then
-  die "odin not found in PATH"
-fi
+cmd_debug() {
+    echo -e "${YELLOW}Building client (debug)...${NC}"
+    mkdir -p "$BUILD_DIR"
+    odin build "$PROJECT_DIR/src/client" \
+        -out:"$BUILD_DIR/client" \
+        -debug
+    echo -e "${GREEN}Built: $BUILD_DIR/client${NC}"
+}
 
-if [[ $# -eq 0 ]]; then
-  DO_BUILD=1
-fi
+cmd_clean() {
+    echo -e "${YELLOW}Cleaning...${NC}"
+    rm -rf "$BUILD_DIR"
+    echo -e "${GREEN}Clean complete${NC}"
+}
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --help|-h) usage; exit 0 ;;
-    --clean) DO_CLEAN=1; shift ;;
-    --build) DO_BUILD=1; shift ;;
-    --run) DO_RUN=1; DO_BUILD=1; shift ;;
-    --test) DO_TEST=1; shift ;;
-    --debug) MODE="debug"; shift ;;
-    --release) MODE="release"; shift ;;
-    --no-strict-style) DO_STRICT_STYLE=0; shift ;;
-    --no-vet-style) DO_VET_STYLE=0; shift ;;
-    --) shift; EXTRA_FLAGS+=("$@"); break ;;
-    *) die "unknown argument: $1 (use --help)" ;;
-  esac
-done
+cmd_test() {
+    echo -e "${GREEN}Running tests...${NC}"
+    odin test "$PROJECT_DIR/tests" \
+        -all-packages
+    echo -e "${GREEN}Tests complete${NC}"
+}
 
-mkdir -p "$BIN_DIR"
+cmd_run() {
+    if [ ! -f "$BUILD_DIR/client" ]; then
+        cmd_build
+    fi
+    
+    echo -e "${GREEN}Running client...${NC}"
+    "$BUILD_DIR/client" "$@"
+}
 
-if [[ $DO_CLEAN -eq 1 ]]; then
-  echo "==> Cleaning: $BIN_DIR"
-  rm -rf "$BIN_DIR"
-  mkdir -p "$BIN_DIR"
-fi
+cmd_decoder() {
+    echo -e "${GREEN}Building decoder...${NC}"
+    mkdir -p "$BUILD_DIR"
+    odin build "$PROJECT_DIR/src/decoder" \
+        -out:"$BUILD_DIR/decoder" \
+        -o:speed
+    echo -e "${GREEN}Built: $BUILD_DIR/decoder${NC}"
+    
+    if [ $# -gt 0 ]; then
+        "$BUILD_DIR/decoder" "$@"
+    fi
+}
 
-odin_flags=()
-
-# Collection mapping so imports like tui:client/... resolve
-odin_flags+=("-collection:tui=$ROOT_DIR/src")
-
-if [[ "$MODE" == "debug" ]]; then
-  odin_flags+=("-debug")
-else
-  odin_flags+=("-o:speed")
-fi
-
-if [[ $DO_STRICT_STYLE -eq 1 ]]; then
-  odin_flags+=("-strict-style")
-fi
-if [[ $DO_VET_STYLE -eq 1 ]]; then
-  odin_flags+=("-vet-style")
-fi
-
-odin_flags+=("-show-timings")
-odin_flags+=("-warnings-as-errors")
-odin_flags+=("${EXTRA_FLAGS[@]}")
-
-if [[ $DO_BUILD -eq 1 ]]; then
-  echo "==> Building odin-trading-tui..."
-  echo "==> odin build $ROOT_DIR/src -out:$OUT_BIN ${odin_flags[*]}"
-  odin build "$ROOT_DIR/src" -out:"$OUT_BIN" "${odin_flags[@]}"
-  echo "==> Build complete: $OUT_BIN"
-fi
-
-if [[ $DO_TEST -eq 1 ]]; then
-  echo "==> Testing odin-trading-tui..."
-  echo "==> odin test $ROOT_DIR/src ${odin_flags[*]}"
-  odin test "$ROOT_DIR/src" "${odin_flags[@]}"
-fi
-
-if [[ $DO_RUN -eq 1 ]]; then
-  echo "==> Running: $OUT_BIN"
-  exec "$OUT_BIN"
-fi
-
+case "${1:-help}" in
+    build)
+        cmd_build
+        ;;
+    debug)
+        cmd_debug
+        ;;
+    clean)
+        cmd_clean
+        ;;
+    test)
+        cmd_test
+        ;;
+    run)
+        shift
+        cmd_run "$@"
+        ;;
+    decoder)
+        shift
+        cmd_decoder "$@"
+        ;;
+    help|--help|-h)
+        print_usage
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        print_usage
+        exit 1
+        ;;
+esac

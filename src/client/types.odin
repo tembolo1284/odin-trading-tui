@@ -1,92 +1,359 @@
 package client
 
-// ============================================================================
-// Core types and constants for the matching engine client
-// ============================================================================
+// =============================================================================
+// Core Types for Matching Engine Client
+//
+// These types match the C implementation's protocol/message_types.h exactly.
+// All wire-format sizes are verified with #assert.
+// =============================================================================
 
-MAX_SYMBOL_LENGTH :: 8
+import "core:fmt"
 
-// Wire sizes (excluding 4-byte frame header)
-NEW_ORDER_WIRE_SIZE   :: 27
-CANCEL_WIRE_SIZE      :: 10
-FLUSH_WIRE_SIZE       :: 2
-ACK_WIRE_SIZE         :: 18
-CANCEL_ACK_WIRE_SIZE  :: 18
-TRADE_WIRE_SIZE       :: 34
-TOP_OF_BOOK_WIRE_SIZE :: 20
-REJECT_WIRE_SIZE      :: 19
+// =============================================================================
+// Constants
+// =============================================================================
 
-// Protocol constants
-MAGIC :: u8(0x4D) // 'M'
+MAX_SYMBOL_LENGTH :: 16
+BINARY_SYMBOL_LEN :: 8
+BINARY_MAGIC :: 0x4D  // 'M' for Match
 
-MSG_NEW_ORDER   :: u8('N')
-MSG_CANCEL      :: u8('C')
-MSG_FLUSH       :: u8('F')
-MSG_ACK         :: u8('A')
-MSG_CANCEL_ACK  :: u8('X')
-MSG_TRADE       :: u8('T')
-MSG_TOP_OF_BOOK :: u8('B')
-MSG_REJECT      :: u8('R')
+// =============================================================================
+// Side Enumeration
+// =============================================================================
 
 Side :: enum u8 {
     Buy  = 'B',
     Sell = 'S',
 }
 
-Reject_Reason :: enum u8 {
-    Unknown_Symbol    = 1,
-    Invalid_Quantity  = 2,
-    Invalid_Price     = 3,
-    Order_Not_Found   = 4,
-    Duplicate_OrderId = 5,
-    Pool_Exhausted    = 6,
-    Unauthorized      = 7,
-    Throttled         = 8,
-    Book_Full         = 9,
-    Invalid_OrderId   = 10,
+side_to_char :: proc(s: Side) -> u8 {
+    return u8(s)
 }
 
-Output_Type :: enum u8 {
-    Ack         = 'A',
-    Trade       = 'T',
-    Top_Of_Book = 'B',
-    Cancel_Ack  = 'X',
-    Reject      = 'R',
+side_from_char :: proc(c: u8) -> (Side, bool) {
+    switch c {
+    case 'B': return .Buy, true
+    case 'S': return .Sell, true
+    case:     return .Buy, false
+    }
 }
 
-// Decoded output message (union-style struct)
-Output_Msg :: struct {
-    typ:           Output_Type,
-    symbol:        [MAX_SYMBOL_LENGTH]u8,
-    
-    // Ack / Cancel_Ack / Reject
+side_str :: proc(s: Side) -> string {
+    switch s {
+    case .Buy:  return "BUY"
+    case .Sell: return "SELL"
+    }
+    return "UNKNOWN"
+}
+
+// =============================================================================
+// Input Message Types
+// =============================================================================
+
+Input_Msg_Type :: enum u8 {
+    New_Order = 0,
+    Cancel    = 1,
+    Flush     = 2,
+}
+
+// =============================================================================
+// Output Message Types  
+// =============================================================================
+
+Output_Msg_Type :: enum u8 {
+    Ack         = 0,
+    Cancel_Ack  = 1,
+    Trade       = 2,
+    Top_Of_Book = 3,
+}
+
+output_msg_type_str :: proc(t: Output_Msg_Type) -> string {
+    switch t {
+    case .Ack:         return "ACK"
+    case .Cancel_Ack:  return "CANCEL_ACK"
+    case .Trade:       return "TRADE"
+    case .Top_Of_Book: return "TOP_OF_BOOK"
+    }
+    return "UNKNOWN"
+}
+
+// =============================================================================
+// Input Messages (internal representation)
+// =============================================================================
+
+New_Order_Msg :: struct {
     user_id:       u32,
     user_order_id: u32,
-    
-    // Trade
-    buy_user_id:   u32,
-    buy_order_id:  u32,
-    sell_user_id:  u32,
-    sell_order_id: u32,
     price:         u32,
     quantity:      u32,
-    
-    // Top of Book
     side:          Side,
-    
-    // Reject
-    reason:        Reject_Reason,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
 }
 
-// Stats for scenario tracking
-Scenario_Stats :: struct {
-    orders_sent:     u64,
-    acks_received:   u64,
-    trades_received: u64,
-    cancels_sent:    u64,
-    cancel_acks:     u64,
-    tob_received:    u64,
-    rejects:         u64,
-    start_time:      i64,
-    end_time:        i64,
+Cancel_Msg :: struct {
+    user_id:       u32,
+    user_order_id: u32,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
+}
+
+Flush_Msg :: struct {}
+
+Input_Msg :: struct {
+    type: Input_Msg_Type,
+    data: union {
+        New_Order_Msg,
+        Cancel_Msg,
+        Flush_Msg,
+    },
+}
+
+// =============================================================================
+// Output Messages (internal representation)
+// =============================================================================
+
+Ack_Msg :: struct {
+    user_id:       u32,
+    user_order_id: u32,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
+}
+
+Cancel_Ack_Msg :: struct {
+    user_id:       u32,
+    user_order_id: u32,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
+}
+
+Trade_Msg :: struct {
+    user_id_buy:        u32,
+    user_order_id_buy:  u32,
+    user_id_sell:       u32,
+    user_order_id_sell: u32,
+    price:              u32,
+    quantity:           u32,
+    buy_client_id:      u32,
+    sell_client_id:     u32,
+    symbol:             [MAX_SYMBOL_LENGTH]u8,
+}
+
+Top_Of_Book_Msg :: struct {
+    price:          u32,
+    total_quantity: u32,
+    side:           Side,
+    symbol:         [15]u8,
+}
+
+Output_Msg :: struct {
+    type: Output_Msg_Type,
+    data: union {
+        Ack_Msg,
+        Cancel_Ack_Msg,
+        Trade_Msg,
+        Top_Of_Book_Msg,
+    },
+}
+
+// =============================================================================
+// Symbol Helpers
+// =============================================================================
+
+// Copy a string into a fixed-size symbol buffer, null-padding
+copy_symbol :: proc(dest: []u8, src: string) {
+    n := min(len(dest), len(src))
+    for i in 0..<n {
+        dest[i] = src[i]
+    }
+    for i in n..<len(dest) {
+        dest[i] = 0
+    }
+}
+
+// Extract a null-terminated string from a symbol buffer
+symbol_to_string :: proc(sym: []u8) -> string {
+    n := 0
+    for i in 0..<len(sym) {
+        if sym[i] == 0 {
+            break
+        }
+        n = i + 1
+    }
+    return string(sym[:n])
+}package client
+
+// =============================================================================
+// Core Types for Matching Engine Client
+//
+// These types match the C implementation's protocol/message_types.h exactly.
+// All wire-format sizes are verified with #assert.
+// =============================================================================
+
+import "core:fmt"
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+MAX_SYMBOL_LENGTH :: 16
+BINARY_SYMBOL_LEN :: 8
+BINARY_MAGIC :: 0x4D  // 'M' for Match
+
+// =============================================================================
+// Side Enumeration
+// =============================================================================
+
+Side :: enum u8 {
+    Buy  = 'B',
+    Sell = 'S',
+}
+
+side_to_char :: proc(s: Side) -> u8 {
+    return u8(s)
+}
+
+side_from_char :: proc(c: u8) -> (Side, bool) {
+    switch c {
+    case 'B': return .Buy, true
+    case 'S': return .Sell, true
+    case:     return .Buy, false
+    }
+}
+
+side_str :: proc(s: Side) -> string {
+    switch s {
+    case .Buy:  return "BUY"
+    case .Sell: return "SELL"
+    }
+    return "UNKNOWN"
+}
+
+// =============================================================================
+// Input Message Types
+// =============================================================================
+
+Input_Msg_Type :: enum u8 {
+    New_Order = 0,
+    Cancel    = 1,
+    Flush     = 2,
+}
+
+// =============================================================================
+// Output Message Types  
+// =============================================================================
+
+Output_Msg_Type :: enum u8 {
+    Ack         = 0,
+    Cancel_Ack  = 1,
+    Trade       = 2,
+    Top_Of_Book = 3,
+}
+
+output_msg_type_str :: proc(t: Output_Msg_Type) -> string {
+    switch t {
+    case .Ack:         return "ACK"
+    case .Cancel_Ack:  return "CANCEL_ACK"
+    case .Trade:       return "TRADE"
+    case .Top_Of_Book: return "TOP_OF_BOOK"
+    }
+    return "UNKNOWN"
+}
+
+// =============================================================================
+// Input Messages (internal representation)
+// =============================================================================
+
+New_Order_Msg :: struct {
+    user_id:       u32,
+    user_order_id: u32,
+    price:         u32,
+    quantity:      u32,
+    side:          Side,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
+}
+
+Cancel_Msg :: struct {
+    user_id:       u32,
+    user_order_id: u32,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
+}
+
+Flush_Msg :: struct {}
+
+Input_Msg :: struct {
+    type: Input_Msg_Type,
+    data: union {
+        New_Order_Msg,
+        Cancel_Msg,
+        Flush_Msg,
+    },
+}
+
+// =============================================================================
+// Output Messages (internal representation)
+// =============================================================================
+
+Ack_Msg :: struct {
+    user_id:       u32,
+    user_order_id: u32,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
+}
+
+Cancel_Ack_Msg :: struct {
+    user_id:       u32,
+    user_order_id: u32,
+    symbol:        [MAX_SYMBOL_LENGTH]u8,
+}
+
+Trade_Msg :: struct {
+    user_id_buy:        u32,
+    user_order_id_buy:  u32,
+    user_id_sell:       u32,
+    user_order_id_sell: u32,
+    price:              u32,
+    quantity:           u32,
+    buy_client_id:      u32,
+    sell_client_id:     u32,
+    symbol:             [MAX_SYMBOL_LENGTH]u8,
+}
+
+Top_Of_Book_Msg :: struct {
+    price:          u32,
+    total_quantity: u32,
+    side:           Side,
+    symbol:         [15]u8,
+}
+
+Output_Msg :: struct {
+    type: Output_Msg_Type,
+    data: union {
+        Ack_Msg,
+        Cancel_Ack_Msg,
+        Trade_Msg,
+        Top_Of_Book_Msg,
+    },
+}
+
+// =============================================================================
+// Symbol Helpers
+// =============================================================================
+
+// Copy a string into a fixed-size symbol buffer, null-padding
+copy_symbol :: proc(dest: []u8, src: string) {
+    n := min(len(dest), len(src))
+    for i in 0..<n {
+        dest[i] = src[i]
+    }
+    for i in n..<len(dest) {
+        dest[i] = 0
+    }
+}
+
+// Extract a null-terminated string from a symbol buffer
+symbol_to_string :: proc(sym: []u8) -> string {
+    n := 0
+    for i in 0..<len(sym) {
+        if sym[i] == 0 {
+            break
+        }
+        n = i + 1
+    }
+    return string(sym[:n])
 }

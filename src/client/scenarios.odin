@@ -2,395 +2,640 @@ package client
 
 import "core:fmt"
 import "core:time"
-import "core:os"
 
-// ============================================================================
-// Test scenarios for the matching engine
-// ============================================================================
-
-Scenario :: enum {
-    // Basic scenarios (1-9)
-    Buy_Sell_No_Match     = 1,   // Buy and sell at different prices, flush
-    Buy_Sell_Full_Match   = 2,   // Buy and sell that fully match
-    Buy_Then_Cancel       = 3,   // Place order then cancel it
-    
-    // Stress tests - single symbol (20-29)
-    Stress_2k_Orders      = 20,  // 2,000 orders -> 1,000 trades
-    Stress_20k_Orders     = 21,  // 20,000 orders -> 10,000 trades
-    Stress_200k_Orders    = 22,  // 200,000 orders -> 100,000 trades
-    
-    // Stress tests - dual symbol/processor (30-39)
-    Dual_2k_Orders        = 30,  // 2,000 orders split AAPL/TSLA
-    Dual_20k_Orders       = 31,  // 20,000 orders split AAPL/TSLA
+Scenario_Category :: enum {
+    Basic,
+    Stress,
+    Matching,
+    Multi_Symbol,
 }
 
-// ============================================================================
-// Scenario runner
-// ============================================================================
-
-run_scenario :: proc(fd: os.Handle, scenario: Scenario, verbose: bool = true) -> (Scenario_Stats, bool) {
-    stats := Scenario_Stats{}
-    stats.start_time = time.now()._nsec
-    
-    ok: bool
-    switch scenario {
-    case .Buy_Sell_No_Match:
-        ok = scenario_buy_sell_no_match(fd, &stats, verbose)
-    case .Buy_Sell_Full_Match:
-        ok = scenario_buy_sell_full_match(fd, &stats, verbose)
-    case .Buy_Then_Cancel:
-        ok = scenario_buy_then_cancel(fd, &stats, verbose)
-    case .Stress_2k_Orders:
-        ok = scenario_stress_single(fd, &stats, 2000, verbose)
-    case .Stress_20k_Orders:
-        ok = scenario_stress_single(fd, &stats, 20000, verbose)
-    case .Stress_200k_Orders:
-        ok = scenario_stress_single(fd, &stats, 200000, verbose)
-    case .Dual_2k_Orders:
-        ok = scenario_stress_dual(fd, &stats, 2000, verbose)
-    case .Dual_20k_Orders:
-        ok = scenario_stress_dual(fd, &stats, 20000, verbose)
-    case:
-        fmt.println("Unknown scenario:", scenario)
-        return stats, false
-    }
-    
-    stats.end_time = time.now()._nsec
-    return stats, ok
+Scenario_Info :: struct {
+    id:          int,
+    name:        string,
+    description: string,
+    category:    Scenario_Category,
+    order_count: u32,
 }
 
-print_stats :: proc(stats: ^Scenario_Stats) {
-    elapsed_ns := stats.end_time - stats.start_time
-    elapsed_ms := f64(elapsed_ns) / 1_000_000.0
-    elapsed_s := elapsed_ms / 1000.0
-    
-    total_msgs := stats.orders_sent + stats.cancels_sent
-    throughput := f64(total_msgs) / elapsed_s if elapsed_s > 0 else 0
-    
-    fmt.println("──────────────────────────────────")
-    fmt.println("Results:")
-    fmt.printf("  Orders sent:     %d\n", stats.orders_sent)
-    fmt.printf("  Cancels sent:    %d\n", stats.cancels_sent)
-    fmt.printf("  ACKs received:   %d\n", stats.acks_received)
-    fmt.printf("  Trades received: %d\n", stats.trades_received)
-    fmt.printf("  Cancel ACKs:     %d\n", stats.cancel_acks)
-    fmt.printf("  Top of Book:     %d\n", stats.tob_received)
-    fmt.printf("  Rejects:         %d\n", stats.rejects)
-    fmt.println("──────────────────────────────────")
-    fmt.printf("  Elapsed:         %.2f ms\n", elapsed_ms)
-    fmt.printf("  Throughput:      %.0f msgs/sec\n", throughput)
-    fmt.println("──────────────────────────────────")
+Scenario_Result :: struct {
+    orders_sent:        u32,
+    orders_failed:      u32,
+    responses_received: u32,
+    trades_executed:    u32,
+    start_time_ns:      i64,
+    end_time_ns:        i64,
+    total_time_ns:      u64,
+    min_latency_ns:     u64,
+    avg_latency_ns:     u64,
+    max_latency_ns:     u64,
+    orders_per_sec:     f64,
+    proc0_orders:       u32,
+    proc1_orders:       u32,
 }
 
-// ============================================================================
-// Response handling - receive and process one message
-// ============================================================================
+SCENARIOS := []Scenario_Info{
+    {1,  "simple-orders",   "Simple orders (no match)",           .Basic,    3},
+    {2,  "matching-trade",  "Matching trade execution",           .Basic,    2},
+    {3,  "cancel-order",    "Cancel order",                       .Basic,    2},
+    {10, "stress-1k",       "Stress: 1K orders",                  .Stress,   1000},
+    {11, "stress-10k",      "Stress: 10K orders",                 .Stress,   10000},
+    {20, "match-1k",        "Matching: 1K pairs",                 .Matching, 2000},
+    {21, "match-10k",       "Matching: 10K pairs",                .Matching, 20000},
+    {22, "match-100k",      "Matching: 100K pairs",               .Matching, 200000},
+    {23, "match-1m",        "Matching: 1M pairs",                 .Matching, 2000000},
+    {24, "match-10m",       "Matching: 10M pairs",                .Matching, 20000000},
+}
 
-recv_one :: proc(fd: os.Handle, stats: ^Scenario_Stats, verbose: bool) -> (Output_Msg, bool) {
-    recv_buf: [4096]u8
-    
-    payload_len, ok := recv_frame(fd, recv_buf[:])
-    if !ok {
-        return {}, false
+Callback_Context :: struct {
+    result:  ^Scenario_Result,
+    verbose: bool,
+}
+
+scenario_response_counter :: proc(msg: ^Output_Msg, user_data: rawptr) {
+    ctx := cast(^Callback_Context)user_data
+    if ctx.result != nil {
+        ctx.result.responses_received += 1
+        if msg.type == .Trade {
+            ctx.result.trades_executed += 1
+        }
     }
-    
-    out: Output_Msg
-    _, decode_ok := decode_output(recv_buf[:payload_len], &out)
-    if !decode_ok {
-        if verbose {
-            fmt.println("  !! Failed to decode response (len=", payload_len, ")")
-        }
-        return {}, false
-    }
-    
-    sym := symbol_to_string(out.symbol[:])
-    
-    switch out.typ {
-    case .Ack:
-        stats.acks_received += 1
-        if verbose {
-            fmt.printf("[RECV] A, %s, %d, %d\n", sym, out.user_id, out.user_order_id)
-        }
-    case .Cancel_Ack:
-        stats.cancel_acks += 1
-        if verbose {
-            fmt.printf("[RECV] C, %s, %d, %d\n", sym, out.user_id, out.user_order_id)
-        }
-    case .Trade:
-        stats.trades_received += 1
-        if verbose {
-            fmt.printf("[RECV] T, %s, buy=%d/%d, sell=%d/%d, px=%d, qty=%d\n", 
-                sym, out.buy_user_id, out.buy_order_id, 
-                out.sell_user_id, out.sell_order_id,
-                out.price, out.quantity)
-        }
-    case .Top_Of_Book:
-        stats.tob_received += 1
-        if verbose {
-            side_char := 'B' if out.side == .Buy else 'S'
-            if out.quantity == 0 {
-                fmt.printf("[RECV] B, %s, %c, -, -\n", sym, side_char)
+    if ctx.verbose {
+        switch msg.type {
+        case .Ack:
+            ack := msg.data.(Ack_Msg)
+            fmt.printf("[RECV] A, %s, %d, %d\n", symbol_to_string(ack.symbol[:]), ack.user_id, ack.user_order_id)
+        case .Cancel_Ack:
+            cack := msg.data.(Cancel_Ack_Msg)
+            fmt.printf("[RECV] C, %s, %d, %d\n", symbol_to_string(cack.symbol[:]), cack.user_id, cack.user_order_id)
+        case .Trade:
+            t := msg.data.(Trade_Msg)
+            fmt.printf("[RECV] T, %s, %d, %d, %d, %d, %d, %d\n",
+                symbol_to_string(t.symbol[:]), t.user_id_buy, t.user_order_id_buy,
+                t.user_id_sell, t.user_order_id_sell, t.price, t.quantity)
+        case .Top_Of_Book:
+            tob := msg.data.(Top_Of_Book_Msg)
+            if tob.price == 0 {
+                fmt.printf("[RECV] B, %s, %c, -, -\n", symbol_to_string(tob.symbol[:]), side_to_char(tob.side))
             } else {
-                fmt.printf("[RECV] B, %s, %c, %d, %d\n", sym, side_char, out.price, out.quantity)
-            }
-        }
-    case .Reject:
-        stats.rejects += 1
-        if verbose {
-            fmt.printf("[RECV] R, %s, %d, %d, reason=%d\n", 
-                sym, out.user_id, out.user_order_id, u8(out.reason))
-        }
-    }
-    
-    return out, true
-}
-
-// Receive exactly N messages
-recv_n :: proc(fd: os.Handle, stats: ^Scenario_Stats, count: int, verbose: bool) -> bool {
-    for _ in 0..<count {
-        _, ok := recv_one(fd, stats, verbose)
-        if !ok {
-            return false
-        }
-    }
-    return true
-}
-
-// ============================================================================
-// Scenario implementations
-// ============================================================================
-
-// Scenario 1: Buy and sell at different prices (no match), then flush
-scenario_buy_sell_no_match :: proc(fd: os.Handle, stats: ^Scenario_Stats, verbose: bool) -> bool {
-    if verbose {
-        fmt.println("=== Scenario 1: Simple Orders (no match) ===")
-    }
-    
-    buf: [64]u8
-    
-    // Send BUY @ 100
-    if verbose { fmt.println("Sending: BUY IBM 50@100") }
-    n, ok := encode_new_order(buf[:], 1, "IBM", 10000, 50, .Buy, 1)
-    if !ok || !send_frame(fd, buf[:n]) {
-        return false
-    }
-    stats.orders_sent += 1
-    
-    // Wait for ACK
-    if !recv_n(fd, stats, 1, verbose) {
-        return false
-    }
-    
-    // Send SELL @ 105 (no match)
-    if verbose { fmt.println("Sending: SELL IBM 50@105") }
-    n, ok = encode_new_order(buf[:], 1, "IBM", 10500, 50, .Sell, 2)
-    if !ok || !send_frame(fd, buf[:n]) {
-        return false
-    }
-    stats.orders_sent += 1
-    
-    // Wait for ACK
-    if !recv_n(fd, stats, 1, verbose) {
-        return false
-    }
-    
-    // Flush (cancels all orders)
-    if verbose { fmt.println("Sending: FLUSH") }
-    n, ok = encode_flush(buf[:])
-    if !ok || !send_frame(fd, buf[:n]) {
-        return false
-    }
-    
-    // Expect: 2 Cancel ACKs + 2 Top of Book (empty for buy/sell side)
-    if !recv_n(fd, stats, 4, verbose) {
-        return false
-    }
-    
-    return true
-}
-
-// Scenario 2: Buy and sell that fully match
-scenario_buy_sell_full_match :: proc(fd: os.Handle, stats: ^Scenario_Stats, verbose: bool) -> bool {
-    if verbose {
-        fmt.println("=== Scenario 2: Matching Orders ===")
-    }
-    
-    buf: [64]u8
-    
-    // Send BUY @ 100
-    if verbose { fmt.println("Sending: BUY IBM 50@100") }
-    n, ok := encode_new_order(buf[:], 1, "IBM", 10000, 50, .Buy, 1)
-    if !ok || !send_frame(fd, buf[:n]) {
-        return false
-    }
-    stats.orders_sent += 1
-    
-    // Wait for ACK
-    if !recv_n(fd, stats, 1, verbose) {
-        return false
-    }
-    
-    // Send SELL @ 100 (matches!)
-    if verbose { fmt.println("Sending: SELL IBM 50@100") }
-    n, ok = encode_new_order(buf[:], 2, "IBM", 10000, 50, .Sell, 1)
-    if !ok || !send_frame(fd, buf[:n]) {
-        return false
-    }
-    stats.orders_sent += 1
-    
-    // Expect: ACK for sell + Trade
-    // (Some engines send 2 trades, one per side - adjust if needed)
-    if !recv_n(fd, stats, 2, verbose) {
-        return false
-    }
-    
-    return true
-}
-
-// Scenario 3: Place order then cancel it
-scenario_buy_then_cancel :: proc(fd: os.Handle, stats: ^Scenario_Stats, verbose: bool) -> bool {
-    if verbose {
-        fmt.println("=== Scenario 3: Order + Cancel ===")
-    }
-    
-    buf: [64]u8
-    
-    // Send BUY
-    if verbose { fmt.println("Sending: BUY IBM 50@100") }
-    n, ok := encode_new_order(buf[:], 1, "IBM", 10000, 50, .Buy, 1)
-    if !ok || !send_frame(fd, buf[:n]) {
-        return false
-    }
-    stats.orders_sent += 1
-    
-    // Wait for ACK
-    if !recv_n(fd, stats, 1, verbose) {
-        return false
-    }
-    
-    // Cancel
-    if verbose { fmt.println("Sending: CANCEL user=1 order=1") }
-    n, ok = encode_cancel(buf[:], 1, 1)
-    if !ok || !send_frame(fd, buf[:n]) {
-        return false
-    }
-    stats.cancels_sent += 1
-    
-    // Wait for Cancel ACK
-    if !recv_n(fd, stats, 1, verbose) {
-        return false
-    }
-    
-    return true
-}
-
-// Scenario 20-22: Stress test single symbol
-scenario_stress_single :: proc(fd: os.Handle, stats: ^Scenario_Stats, order_count: int, verbose: bool) -> bool {
-    fmt.printf("=== Stress Test: %d orders (single symbol) ===\n", order_count)
-    fmt.println("Expecting", order_count/2, "trades")
-    
-    buf: [64]u8
-    half := order_count / 2
-    price := u32(10000)  // $100.00
-    
-    // Send all BUYs first
-    fmt.println("Sending", half, "BUY orders...")
-    for i in 0..<half {
-        n, ok := encode_new_order(buf[:], 1, "AAPL", price, 100, .Buy, u32(i + 1))
-        if !ok || !send_frame(fd, buf[:n]) {
-            fmt.println("Failed at BUY order", i)
-            return false
-        }
-        stats.orders_sent += 1
-        
-        // Receive ACK immediately to avoid buffer buildup
-        if !recv_n(fd, stats, 1, false) {
-            fmt.println("Failed to receive ACK for BUY", i)
-            return false
-        }
-    }
-    
-    // Send all SELLs (will match)
-    fmt.println("Sending", half, "SELL orders (will match)...")
-    for i in 0..<half {
-        n, ok := encode_new_order(buf[:], 2, "AAPL", price, 100, .Sell, u32(i + 1))
-        if !ok || !send_frame(fd, buf[:n]) {
-            fmt.println("Failed at SELL order", i)
-            return false
-        }
-        stats.orders_sent += 1
-        
-        // Receive ACK + Trade
-        if !recv_n(fd, stats, 2, false) {
-            fmt.println("Failed to receive responses for SELL", i)
-            return false
-        }
-    }
-    
-    fmt.println("Done!")
-    return true
-}
-
-// Scenario 30-31: Stress test dual symbols (for dual-processor routing)
-scenario_stress_dual :: proc(fd: os.Handle, stats: ^Scenario_Stats, order_count: int, verbose: bool) -> bool {
-    fmt.printf("=== Stress Test: %d orders (dual symbol AAPL/TSLA) ===\n", order_count)
-    fmt.println("Expecting", order_count/2, "trades total")
-    
-    buf: [64]u8
-    quarter := order_count / 4
-    price := u32(10000)
-    
-    symbols := [2]string{"AAPL", "TSLA"}
-    
-    // Send BUYs for both symbols
-    fmt.println("Sending", quarter * 2, "BUY orders across AAPL/TSLA...")
-    for i in 0..<quarter {
-        for sym_idx in 0..<2 {
-            n, ok := encode_new_order(
-                buf[:], 
-                u32(sym_idx + 1),
-                symbols[sym_idx], 
-                price, 
-                100, 
-                .Buy, 
-                u32(i + 1),
-            )
-            if !ok || !send_frame(fd, buf[:n]) {
-                return false
-            }
-            stats.orders_sent += 1
-            
-            if !recv_n(fd, stats, 1, false) {
-                return false
+                fmt.printf("[RECV] B, %s, %c, %d, %d\n",
+                    symbol_to_string(tob.symbol[:]), side_to_char(tob.side), tob.price, tob.total_quantity)
             }
         }
     }
+}
+
+init_result :: proc(result: ^Scenario_Result) {
+    result^ = {}
+}
+
+finalize_result :: proc(result: ^Scenario_Result, client: ^Engine_Client) {
+    result.end_time_ns = time.now()._nsec
+    result.total_time_ns = u64(result.end_time_ns - result.start_time_ns)
+    result.min_latency_ns = engine_client_get_min_latency_ns(client)
+    result.avg_latency_ns = engine_client_get_avg_latency_ns(client)
+    result.max_latency_ns = engine_client_get_max_latency_ns(client)
+    if result.total_time_ns > 0 {
+        seconds := f64(result.total_time_ns) / 1e9
+        result.orders_per_sec = f64(result.orders_sent) / seconds
+    }
+}
+
+sleep_ms :: proc(ms: int) {
+    time.sleep(time.Duration(ms) * time.Millisecond)
+}
+
+drain_responses :: proc(client: ^Engine_Client, initial_delay_ms: int) {
+    sleep_ms(initial_delay_ms)
+    empty_count := 0
+    for empty_count < 5 {
+        count := engine_client_recv_all(client, 50)
+        if count == 0 {
+            empty_count += 1
+            sleep_ms(20)
+        } else {
+            empty_count = 0
+        }
+    }
+}
+
+scenario_get_info :: proc(id: int) -> ^Scenario_Info {
+    for &s in SCENARIOS {
+        if s.id == id { return &s }
+    }
+    return nil
+}
+
+scenario_is_valid :: proc(id: int) -> bool {
+    return scenario_get_info(id) != nil
+}
+
+scenario_print_list :: proc() {
+    fmt.println("Available scenarios:\n")
+    fmt.println("Basic:")
+    for s in SCENARIOS { if s.category == .Basic { fmt.printf("  %-3d - %s\n", s.id, s.description) } }
+    fmt.println("\nStress:")
+    for s in SCENARIOS { if s.category == .Stress { fmt.printf("  %-3d - %s\n", s.id, s.description) } }
+    fmt.println("\nMatching:")
+    for s in SCENARIOS { if s.category == .Matching { fmt.printf("  %-3d - %s\n", s.id, s.description) } }
+}
+
+scenario_print_result :: proc(result: ^Scenario_Result) {
+    fmt.println("\n=== Scenario Results ===\n")
+    fmt.printf("Orders sent: %d, Failed: %d, Responses: %d, Trades: %d\n",
+        result.orders_sent, result.orders_failed, result.responses_received, result.trades_executed)
+    fmt.printf("Time: %.3f sec, Rate: %.0f orders/sec\n",
+        f64(result.total_time_ns) / 1e9, result.orders_per_sec)
+    if result.min_latency_ns > 0 {
+        fmt.printf("Latency - Min: %.3f us, Avg: %.3f us, Max: %.3f us\n",
+            f64(result.min_latency_ns)/1000, f64(result.avg_latency_ns)/1000, f64(result.max_latency_ns)/1000)
+    }
+}
+
+scenario_simple_orders :: proc(client: ^Engine_Client, result: ^Scenario_Result) -> bool {
+    fmt.println("=== Scenario 1: Simple Orders ===\n")
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, true}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
     
-    // Send SELLs for both symbols (will match)
-    fmt.println("Sending", quarter * 2, "SELL orders across AAPL/TSLA...")
-    for i in 0..<quarter {
-        for sym_idx in 0..<2 {
-            n, ok := encode_new_order(
-                buf[:], 
-                u32(sym_idx + 10),
-                symbols[sym_idx], 
-                price, 
-                100, 
-                .Sell, 
-                u32(i + 1),
-            )
-            if !ok || !send_frame(fd, buf[:n]) {
-                return false
-            }
-            stats.orders_sent += 1
-            
-            // ACK + Trade
-            if !recv_n(fd, stats, 2, false) {
-                return false
-            }
+    fmt.println("Sending: BUY IBM 50@100")
+    if engine_client_send_order(client, "IBM", 100, 50, .Buy, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.println("Sending: SELL IBM 50@105")
+    if engine_client_send_order(client, "IBM", 105, 50, .Sell, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.println("Sending: FLUSH")
+    engine_client_send_flush(client)
+    result.orders_sent += 1
+    drain_responses(client, 250)
+    
+    finalize_result(result, client)
+    return true
+}
+
+scenario_matching_trade :: proc(client: ^Engine_Client, result: ^Scenario_Result) -> bool {
+    fmt.println("=== Scenario 2: Matching Trade ===\n")
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, true}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    fmt.println("Sending: BUY IBM 50@100")
+    if engine_client_send_order(client, "IBM", 100, 50, .Buy, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.println("Sending: SELL IBM 50@100 (should match!)")
+    if engine_client_send_order(client, "IBM", 100, 50, .Sell, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 200)
+    
+    finalize_result(result, client)
+    return true
+}
+
+scenario_cancel_order :: proc(client: ^Engine_Client, result: ^Scenario_Result) -> bool {
+    fmt.println("=== Scenario 3: Cancel Order ===\n")
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, true}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    fmt.println("Sending: BUY IBM 50@100")
+    oid := engine_client_send_order(client, "IBM", 100, 50, .Buy, 0)
+    if oid > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.printf("Sending: CANCEL order %d\n", oid)
+    engine_client_send_cancel(client, oid)
+    drain_responses(client, 150)
+    
+    finalize_result(result, client)
+    return true
+}
+
+scenario_stress_test :: proc(client: ^Engine_Client, count: u32, result: ^Scenario_Result) -> bool {
+    fmt.printf("=== Stress Test: %d Orders ===\n\n", count)
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, false}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    engine_client_send_flush(client)
+    drain_responses(client, 100)
+    result.responses_received = 0
+    
+    progress_interval := count / 20
+    if progress_interval == 0 { progress_interval = 1 }
+    
+    for i: u32 = 0; i < count; i += 1 {
+        price := 100 + (i % 100)
+        if engine_client_send_order(client, "IBM", price, 10, .Buy, 0) > 0 {
+            result.orders_sent += 1
+        } else {
+            result.orders_failed += 1
+        }
+        engine_client_recv_all(client, 0)
+        if i > 0 && i % progress_interval == 0 {
+            fmt.printf("  %d%%\n", (i * 100) / count)
         }
     }
     
-    fmt.println("Done!")
+    fmt.println("\nFlushing...")
+    engine_client_send_flush(client)
+    drain_responses(client, 500)
+    
+    finalize_result(result, client)
+    scenario_print_result(result)
     return true
+}
+
+scenario_matching_stress :: proc(client: ^Engine_Client, pairs: u32, result: ^Scenario_Result) -> bool {
+    fmt.printf("=== Matching Stress: %d Pairs ===\n\n", pairs)
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, false}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    engine_client_send_flush(client)
+    drain_responses(client, 200)
+    result.responses_received = 0
+    
+    progress_interval := pairs / 20
+    if progress_interval == 0 { progress_interval = 1 }
+    
+    for i: u32 = 0; i < pairs; i += 1 {
+        price := 100 + (i % 50)
+        if engine_client_send_order(client, "IBM", price, 10, .Buy, 0) > 0 { result.orders_sent += 1 }
+        engine_client_recv_all(client, 0)
+        if engine_client_send_order(client, "IBM", price, 10, .Sell, 0) > 0 { result.orders_sent += 1 }
+        engine_client_recv_all(client, 0)
+        if i > 0 && i % progress_interval == 0 {
+            fmt.printf("  %d%% | %d trades\n", (i * 100) / pairs, result.trades_executed)
+        }
+    }
+    
+    fmt.println("\nDraining...")
+    for j := 0; j < 100 && result.trades_executed < pairs; j += 1 {
+        engine_client_recv_all(client, 100)
+    }
+    
+    finalize_result(result, client)
+    scenario_print_result(result)
+    
+    if result.trades_executed == pairs {
+        fmt.printf("✓ All %d trades executed!\n\n", pairs)
+    } else {
+        fmt.printf("⚠ Expected %d trades, got %d\n\n", pairs, result.trades_executed)
+    }
+    return true
+}
+
+scenario_run :: proc(client: ^Engine_Client, id: int, danger_burst: bool, result: ^Scenario_Result) -> bool {
+    info := scenario_get_info(id)
+    if info == nil {
+        fmt.printf("Unknown scenario: %d\n\n", id)
+        scenario_print_list()
+        return false
+    }
+    
+    engine_client_reset_stats(client)
+    engine_client_reset_order_id(client, 1)
+    
+    switch id {
+    case 1:  return scenario_simple_orders(client, result)
+    case 2:  return scenario_matching_trade(client, result)
+    case 3:  return scenario_cancel_order(client, result)
+    case 10: return scenario_stress_test(client, 1000, result)
+    case 11: return scenario_stress_test(client, 10000, result)
+    case 20: return scenario_matching_stress(client, 1000, result)
+    case 21: return scenario_matching_stress(client, 10000, result)
+    case 22: return scenario_matching_stress(client, 100000, result)
+    case 23: return scenario_matching_stress(client, 1000000, result)
+    case 24: return scenario_matching_stress(client, 10000000, result)
+    case:
+        fmt.printf("Scenario %d not implemented\n", id)
+        return false
+    }
+}package client
+
+import "core:fmt"
+import "core:time"
+
+Scenario_Category :: enum {
+    Basic,
+    Stress,
+    Matching,
+    Multi_Symbol,
+}
+
+Scenario_Info :: struct {
+    id:          int,
+    name:        string,
+    description: string,
+    category:    Scenario_Category,
+    order_count: u32,
+}
+
+Scenario_Result :: struct {
+    orders_sent:        u32,
+    orders_failed:      u32,
+    responses_received: u32,
+    trades_executed:    u32,
+    start_time_ns:      i64,
+    end_time_ns:        i64,
+    total_time_ns:      u64,
+    min_latency_ns:     u64,
+    avg_latency_ns:     u64,
+    max_latency_ns:     u64,
+    orders_per_sec:     f64,
+    proc0_orders:       u32,
+    proc1_orders:       u32,
+}
+
+SCENARIOS := []Scenario_Info{
+    {1,  "simple-orders",   "Simple orders (no match)",           .Basic,    3},
+    {2,  "matching-trade",  "Matching trade execution",           .Basic,    2},
+    {3,  "cancel-order",    "Cancel order",                       .Basic,    2},
+    {10, "stress-1k",       "Stress: 1K orders",                  .Stress,   1000},
+    {11, "stress-10k",      "Stress: 10K orders",                 .Stress,   10000},
+    {20, "match-1k",        "Matching: 1K pairs",                 .Matching, 2000},
+    {21, "match-10k",       "Matching: 10K pairs",                .Matching, 20000},
+    {22, "match-100k",      "Matching: 100K pairs",               .Matching, 200000},
+    {23, "match-1m",        "Matching: 1M pairs",                 .Matching, 2000000},
+    {24, "match-10m",       "Matching: 10M pairs",                .Matching, 20000000},
+}
+
+Callback_Context :: struct {
+    result:  ^Scenario_Result,
+    verbose: bool,
+}
+
+scenario_response_counter :: proc(msg: ^Output_Msg, user_data: rawptr) {
+    ctx := cast(^Callback_Context)user_data
+    if ctx.result != nil {
+        ctx.result.responses_received += 1
+        if msg.type == .Trade {
+            ctx.result.trades_executed += 1
+        }
+    }
+    if ctx.verbose {
+        switch msg.type {
+        case .Ack:
+            ack := msg.data.(Ack_Msg)
+            fmt.printf("[RECV] A, %s, %d, %d\n", symbol_to_string(ack.symbol[:]), ack.user_id, ack.user_order_id)
+        case .Cancel_Ack:
+            cack := msg.data.(Cancel_Ack_Msg)
+            fmt.printf("[RECV] C, %s, %d, %d\n", symbol_to_string(cack.symbol[:]), cack.user_id, cack.user_order_id)
+        case .Trade:
+            t := msg.data.(Trade_Msg)
+            fmt.printf("[RECV] T, %s, %d, %d, %d, %d, %d, %d\n",
+                symbol_to_string(t.symbol[:]), t.user_id_buy, t.user_order_id_buy,
+                t.user_id_sell, t.user_order_id_sell, t.price, t.quantity)
+        case .Top_Of_Book:
+            tob := msg.data.(Top_Of_Book_Msg)
+            if tob.price == 0 {
+                fmt.printf("[RECV] B, %s, %c, -, -\n", symbol_to_string(tob.symbol[:]), side_to_char(tob.side))
+            } else {
+                fmt.printf("[RECV] B, %s, %c, %d, %d\n",
+                    symbol_to_string(tob.symbol[:]), side_to_char(tob.side), tob.price, tob.total_quantity)
+            }
+        }
+    }
+}
+
+init_result :: proc(result: ^Scenario_Result) {
+    result^ = {}
+}
+
+finalize_result :: proc(result: ^Scenario_Result, client: ^Engine_Client) {
+    result.end_time_ns = time.now()._nsec
+    result.total_time_ns = u64(result.end_time_ns - result.start_time_ns)
+    result.min_latency_ns = engine_client_get_min_latency_ns(client)
+    result.avg_latency_ns = engine_client_get_avg_latency_ns(client)
+    result.max_latency_ns = engine_client_get_max_latency_ns(client)
+    if result.total_time_ns > 0 {
+        seconds := f64(result.total_time_ns) / 1e9
+        result.orders_per_sec = f64(result.orders_sent) / seconds
+    }
+}
+
+sleep_ms :: proc(ms: int) {
+    time.sleep(time.Duration(ms) * time.Millisecond)
+}
+
+drain_responses :: proc(client: ^Engine_Client, initial_delay_ms: int) {
+    sleep_ms(initial_delay_ms)
+    empty_count := 0
+    for empty_count < 5 {
+        count := engine_client_recv_all(client, 50)
+        if count == 0 {
+            empty_count += 1
+            sleep_ms(20)
+        } else {
+            empty_count = 0
+        }
+    }
+}
+
+scenario_get_info :: proc(id: int) -> ^Scenario_Info {
+    for &s in SCENARIOS {
+        if s.id == id { return &s }
+    }
+    return nil
+}
+
+scenario_is_valid :: proc(id: int) -> bool {
+    return scenario_get_info(id) != nil
+}
+
+scenario_print_list :: proc() {
+    fmt.println("Available scenarios:\n")
+    fmt.println("Basic:")
+    for s in SCENARIOS { if s.category == .Basic { fmt.printf("  %-3d - %s\n", s.id, s.description) } }
+    fmt.println("\nStress:")
+    for s in SCENARIOS { if s.category == .Stress { fmt.printf("  %-3d - %s\n", s.id, s.description) } }
+    fmt.println("\nMatching:")
+    for s in SCENARIOS { if s.category == .Matching { fmt.printf("  %-3d - %s\n", s.id, s.description) } }
+}
+
+scenario_print_result :: proc(result: ^Scenario_Result) {
+    fmt.println("\n=== Scenario Results ===\n")
+    fmt.printf("Orders sent: %d, Failed: %d, Responses: %d, Trades: %d\n",
+        result.orders_sent, result.orders_failed, result.responses_received, result.trades_executed)
+    fmt.printf("Time: %.3f sec, Rate: %.0f orders/sec\n",
+        f64(result.total_time_ns) / 1e9, result.orders_per_sec)
+    if result.min_latency_ns > 0 {
+        fmt.printf("Latency - Min: %.3f us, Avg: %.3f us, Max: %.3f us\n",
+            f64(result.min_latency_ns)/1000, f64(result.avg_latency_ns)/1000, f64(result.max_latency_ns)/1000)
+    }
+}
+
+scenario_simple_orders :: proc(client: ^Engine_Client, result: ^Scenario_Result) -> bool {
+    fmt.println("=== Scenario 1: Simple Orders ===\n")
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, true}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    fmt.println("Sending: BUY IBM 50@100")
+    if engine_client_send_order(client, "IBM", 100, 50, .Buy, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.println("Sending: SELL IBM 50@105")
+    if engine_client_send_order(client, "IBM", 105, 50, .Sell, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.println("Sending: FLUSH")
+    engine_client_send_flush(client)
+    result.orders_sent += 1
+    drain_responses(client, 250)
+    
+    finalize_result(result, client)
+    return true
+}
+
+scenario_matching_trade :: proc(client: ^Engine_Client, result: ^Scenario_Result) -> bool {
+    fmt.println("=== Scenario 2: Matching Trade ===\n")
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, true}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    fmt.println("Sending: BUY IBM 50@100")
+    if engine_client_send_order(client, "IBM", 100, 50, .Buy, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.println("Sending: SELL IBM 50@100 (should match!)")
+    if engine_client_send_order(client, "IBM", 100, 50, .Sell, 0) > 0 { result.orders_sent += 1 }
+    drain_responses(client, 200)
+    
+    finalize_result(result, client)
+    return true
+}
+
+scenario_cancel_order :: proc(client: ^Engine_Client, result: ^Scenario_Result) -> bool {
+    fmt.println("=== Scenario 3: Cancel Order ===\n")
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, true}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    fmt.println("Sending: BUY IBM 50@100")
+    oid := engine_client_send_order(client, "IBM", 100, 50, .Buy, 0)
+    if oid > 0 { result.orders_sent += 1 }
+    drain_responses(client, 150)
+    
+    fmt.printf("Sending: CANCEL order %d\n", oid)
+    engine_client_send_cancel(client, oid)
+    drain_responses(client, 150)
+    
+    finalize_result(result, client)
+    return true
+}
+
+scenario_stress_test :: proc(client: ^Engine_Client, count: u32, result: ^Scenario_Result) -> bool {
+    fmt.printf("=== Stress Test: %d Orders ===\n\n", count)
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, false}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    engine_client_send_flush(client)
+    drain_responses(client, 100)
+    result.responses_received = 0
+    
+    progress_interval := count / 20
+    if progress_interval == 0 { progress_interval = 1 }
+    
+    for i: u32 = 0; i < count; i += 1 {
+        price := 100 + (i % 100)
+        if engine_client_send_order(client, "IBM", price, 10, .Buy, 0) > 0 {
+            result.orders_sent += 1
+        } else {
+            result.orders_failed += 1
+        }
+        engine_client_recv_all(client, 0)
+        if i > 0 && i % progress_interval == 0 {
+            fmt.printf("  %d%%\n", (i * 100) / count)
+        }
+    }
+    
+    fmt.println("\nFlushing...")
+    engine_client_send_flush(client)
+    drain_responses(client, 500)
+    
+    finalize_result(result, client)
+    scenario_print_result(result)
+    return true
+}
+
+scenario_matching_stress :: proc(client: ^Engine_Client, pairs: u32, result: ^Scenario_Result) -> bool {
+    fmt.printf("=== Matching Stress: %d Pairs ===\n\n", pairs)
+    init_result(result)
+    result.start_time_ns = time.now()._nsec
+    ctx := Callback_Context{result, false}
+    engine_client_set_response_callback(client, scenario_response_counter, &ctx)
+    
+    engine_client_send_flush(client)
+    drain_responses(client, 200)
+    result.responses_received = 0
+    
+    progress_interval := pairs / 20
+    if progress_interval == 0 { progress_interval = 1 }
+    
+    for i: u32 = 0; i < pairs; i += 1 {
+        price := 100 + (i % 50)
+        if engine_client_send_order(client, "IBM", price, 10, .Buy, 0) > 0 { result.orders_sent += 1 }
+        engine_client_recv_all(client, 0)
+        if engine_client_send_order(client, "IBM", price, 10, .Sell, 0) > 0 { result.orders_sent += 1 }
+        engine_client_recv_all(client, 0)
+        if i > 0 && i % progress_interval == 0 {
+            fmt.printf("  %d%% | %d trades\n", (i * 100) / pairs, result.trades_executed)
+        }
+    }
+    
+    fmt.println("\nDraining...")
+    for j := 0; j < 100 && result.trades_executed < pairs; j += 1 {
+        engine_client_recv_all(client, 100)
+    }
+    
+    finalize_result(result, client)
+    scenario_print_result(result)
+    
+    if result.trades_executed == pairs {
+        fmt.printf("✓ All %d trades executed!\n\n", pairs)
+    } else {
+        fmt.printf("⚠ Expected %d trades, got %d\n\n", pairs, result.trades_executed)
+    }
+    return true
+}
+
+scenario_run :: proc(client: ^Engine_Client, id: int, danger_burst: bool, result: ^Scenario_Result) -> bool {
+    info := scenario_get_info(id)
+    if info == nil {
+        fmt.printf("Unknown scenario: %d\n\n", id)
+        scenario_print_list()
+        return false
+    }
+    
+    engine_client_reset_stats(client)
+    engine_client_reset_order_id(client, 1)
+    
+    switch id {
+    case 1:  return scenario_simple_orders(client, result)
+    case 2:  return scenario_matching_trade(client, result)
+    case 3:  return scenario_cancel_order(client, result)
+    case 10: return scenario_stress_test(client, 1000, result)
+    case 11: return scenario_stress_test(client, 10000, result)
+    case 20: return scenario_matching_stress(client, 1000, result)
+    case 21: return scenario_matching_stress(client, 10000, result)
+    case 22: return scenario_matching_stress(client, 100000, result)
+    case 23: return scenario_matching_stress(client, 1000000, result)
+    case 24: return scenario_matching_stress(client, 10000000, result)
+    case:
+        fmt.printf("Scenario %d not implemented\n", id)
+        return false
+    }
 }
