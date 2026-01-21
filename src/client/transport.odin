@@ -10,6 +10,7 @@ package client
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:time"
 
 // =============================================================================
 // Constants
@@ -181,7 +182,7 @@ transport_send :: proc(t: ^Transport, data: []u8) -> bool {
 // Receive a complete message
 // For TCP: handles framing
 // For UDP: returns single datagram
-// timeout_ms: 0 = non-blocking, -1 = block forever
+// timeout_ms: 0 = non-blocking, >0 = poll with timeout
 transport_recv :: proc(t: ^Transport, buffer: []u8, timeout_ms: int = 0) -> ([]u8, bool) {
     if t.state != .Connected {
         return nil, false
@@ -207,15 +208,41 @@ tcp_recv :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> ([]u8, bool) {
         return buffer[:len(msg)], true
     }
 
-    // Need to read more data
-    // Set timeout (simplified - would use poll in production)
-    if timeout_ms == 0 {
-        net.set_blocking(t.socket, false)
-    } else {
-        net.set_blocking(t.socket, true)
-    }
+    // Always use non-blocking mode to avoid hanging
+    net.set_blocking(t.socket, false)
 
     recv_buf: [TRANSPORT_RECV_BUFFER_SIZE]u8
+    
+    // If timeout_ms > 0, poll with small sleeps
+    if timeout_ms > 0 {
+        poll_interval_ms :: 10
+        iterations := timeout_ms / poll_interval_ms
+        if iterations < 1 {
+            iterations = 1
+        }
+        
+        for _ in 0..<iterations {
+            received, err := net.recv_tcp(t.socket, recv_buf[:])
+            if err == nil && received > 0 {
+                t.bytes_received += u64(received)
+                framing_read_append(&t.read_state, recv_buf[:received])
+                
+                result, msg = framing_read_extract(&t.read_state)
+                if result == .Message_Ready {
+                    if len(msg) > len(buffer) {
+                        return nil, false
+                    }
+                    mem.copy(raw_data(buffer), raw_data(msg), len(msg))
+                    t.messages_received += 1
+                    return buffer[:len(msg)], true
+                }
+            }
+            time.sleep(time.Duration(poll_interval_ms) * time.Millisecond)
+        }
+        return nil, false
+    }
+    
+    // Non-blocking: single attempt
     received, err := net.recv_tcp(t.socket, recv_buf[:])
     if err != nil || received <= 0 {
         if received == 0 {
@@ -243,12 +270,30 @@ tcp_recv :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> ([]u8, bool) {
 
 // UDP receive
 udp_recv :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> ([]u8, bool) {
-    if timeout_ms == 0 {
-        net.set_blocking(t.udp_socket, false)
-    } else {
-        net.set_blocking(t.udp_socket, true)
+    // Always use non-blocking mode
+    net.set_blocking(t.udp_socket, false)
+    
+    // If timeout_ms > 0, poll with small sleeps
+    if timeout_ms > 0 {
+        poll_interval_ms :: 10
+        iterations := timeout_ms / poll_interval_ms
+        if iterations < 1 {
+            iterations = 1
+        }
+        
+        for _ in 0..<iterations {
+            received, _, err := net.recv_udp(t.udp_socket, buffer)
+            if err == nil && received > 0 {
+                t.bytes_received += u64(received)
+                t.messages_received += 1
+                return buffer[:received], true
+            }
+            time.sleep(time.Duration(poll_interval_ms) * time.Millisecond)
+        }
+        return nil, false
     }
 
+    // Non-blocking: single attempt
     received, _, err := net.recv_udp(t.udp_socket, buffer)
     if err != nil || received <= 0 {
         return nil, false
@@ -307,7 +352,7 @@ resolve_endpoint :: proc(host: string, port: u16) -> (net.Endpoint, bool) {
         return net.Endpoint{addr, int(port)}, true
     }
 
-    // Try DNS resolution - resolve returns (Endpoint, Endpoint, error)
+    // Try DNS resolution
     ip4_endpoint, _, err := net.resolve(host)
     if err != nil {
         return {}, false
