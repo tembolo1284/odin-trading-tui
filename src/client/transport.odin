@@ -223,6 +223,7 @@ tcp_recv :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> ([]u8, bool) {
         
         for _ in 0..<iterations {
             received, err := net.recv_tcp(t.socket, recv_buf[:])
+            // Only process if we got data (not an error or would-block)
             if err == nil && received > 0 {
                 t.bytes_received += u64(received)
                 framing_read_append(&t.read_state, recv_buf[:received])
@@ -244,12 +245,21 @@ tcp_recv :: proc(t: ^Transport, buffer: []u8, timeout_ms: int) -> ([]u8, bool) {
     
     // Non-blocking: single attempt
     received, err := net.recv_tcp(t.socket, recv_buf[:])
-    if err != nil || received <= 0 {
-        if received == 0 {
-            t.state = .Disconnected
-        }
+    
+    // In non-blocking mode, no data available is normal - don't disconnect!
+    // Only disconnect if we get a clean close (received == 0 with no error)
+    // or a real connection error
+    if received <= 0 {
+        // Don't set disconnected for would-block or timeout - that's normal
+        // Only disconnect on actual connection close/error
+        // For now, just return false without disconnecting
         return nil, false
     }
+    
+    if err != nil {
+        return nil, false
+    }
+    
     t.bytes_received += u64(received)
 
     // Append to framing buffer
